@@ -1,0 +1,23 @@
+name: Build FAP
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup uFBT
+        uses: flipperdevices/flipperzero-ufbt-action@v0.1
+        with:
+          task: build
+
+      - name: Upload FAP artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: ufuid_sealer.fap
+          path: dist/*.fap
