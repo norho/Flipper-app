@@ -19,7 +19,7 @@ static bool nfc_send_recv(
 
     FuriHalNfcEvent event;
     while(timeout_ms > 0) {
-        event = furi_hal_nfc_wait_event_common(10);
+        event = furi_hal_nfc_wait_event(10);;
         timeout_ms -= 10;
         if(event & FuriHalNfcEventRxEnd) break;
     }
