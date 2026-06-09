@@ -1,0 +1,9 @@
+App(
+    appid="ufuid_sealer",
+    name="UFUID Sealer",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="ufuid_sealer_app",
+    requires=["gui"],
+    stack_size=2 * 1024,
+    fap_category="NFC",
+)
