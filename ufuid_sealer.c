@@ -8,7 +8,11 @@
 
 #define TAG "UFUID_Sealer"
 
-// Helper: Calcolo e accodamento del CRC-A
+// =========================================================
+// HELPER NFC E CALCOLI
+// =========================================================
+
+// Calcolo e accodamento del CRC-A
 static void append_crc(uint8_t* data, size_t len) {
     uint16_t crc = 0x6363; 
     for(size_t i = 0; i < len; i++) {
@@ -21,7 +25,7 @@ static void append_crc(uint8_t* data, size_t len) {
     data[len+1] = (crc >> 8) & 0xFF;
 }
 
-// FIX: Funzione di invio/ricezione con Polling attivo e robusto
+// Funzione di invio/ricezione con Polling attivo e robusto
 static bool nfc_send_recv(
     uint8_t* tx, size_t tx_bits,
     uint8_t* rx, size_t rx_max, size_t* rx_bits,
@@ -41,7 +45,7 @@ static bool nfc_send_recv(
     return false;
 }
 
-// FIX: Protocollo obbligatorio di Risveglio e Selezione ISO14443A
+// Protocollo obbligatorio di Risveglio e Selezione ISO14443A
 static bool nfc_iso14443a_wake_and_select(void) {
     uint8_t rx[16];
     size_t rx_bits = 0;
@@ -92,7 +96,11 @@ static bool nfc_write_block(uint8_t block_num, uint8_t* data) {
     return (rx_bits >= 4 && (rx[0] & 0x0F) == 0x0A);
 }
 
-// MOTORE CONDIVISO CON SUPPORTO BACKDOOR UFUID
+// =========================================================
+// MOTORE DI SCRITTURA E FUNZIONI LOGICHE
+// =========================================================
+
+// Motore condiviso con supporto Backdoor UFUID
 static bool core_write_mifare_bin(const char* file_path, bool is_ufuid) {
     Storage* storage = furi_record_open(RECORD_STORAGE);
     File* file = storage_file_alloc(storage);
@@ -130,6 +138,7 @@ static bool core_write_mifare_bin(const char* file_path, bool is_ufuid) {
 
 static bool write_fuid(const char* file_path) { return core_write_mifare_bin(file_path, false); }
 static bool write_ufuid(const char* file_path) { return core_write_mifare_bin(file_path, true); }
+
 static bool seal_ufuid(void) {
     uint8_t rx[4];
     size_t rx_bits = 0;
@@ -158,6 +167,7 @@ static bool seal_ufuid(void) {
 // =========================================================
 // STRUTTURE DATI GUI E STATI
 // =========================================================
+
 typedef enum { AppMenu, AppProcessing, AppSuccess, AppError } AppState;
 
 typedef struct {
@@ -167,7 +177,7 @@ typedef struct {
     FuriMessageQueue* event_queue;
 } AppContext;
 
-// FIX: Helper che cerca attivamente il tag svegliandolo
+// Helper che cerca attivamente il tag svegliandolo
 static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
     bool result = false;
     if(furi_hal_nfc_is_hal_ready() != FuriHalNfcErrorNone) return false;
@@ -244,6 +254,7 @@ static void input_callback(InputEvent* input_event, void* ctx) {
 // =========================================================
 // ENTRY POINT DELL'APPLICAZIONE
 // =========================================================
+
 int32_t ufuid_sealer_app(void* p) {
     UNUSED(p);
 
@@ -324,3 +335,4 @@ int32_t ufuid_sealer_app(void* p) {
     free(context);
 
     return 0;
+}
