@@ -57,8 +57,7 @@ static void force_hardware_reset(uint32_t ms_charge) {
 }
 
 // =========================================================
-// WAKE+SELECT — usa short_frame per WUPA a 7 bit
-// Usato da FUID e UFUID
+// WAKE+SELECT — short_frame per WUPA a 7 bit
 // =========================================================
 
 static bool nfc_iso14443a_wake_and_select(void) {
@@ -92,7 +91,7 @@ static bool nfc_iso14443a_wake_and_select(void) {
 }
 
 // =========================================================
-// BACKDOOR GEN1 — invariata
+// BACKDOOR GEN1
 // =========================================================
 
 static bool gen1_magic_knock(void) {
@@ -123,16 +122,33 @@ static bool gen1_magic_knock(void) {
 }
 
 // =========================================================
-// PREPARE FUID — wake+select con short_frame poi knock
+// PREPARE FUID
+// Sequenza: wake (per caricare tag) → HALT → power cycle → knock a freddo
 // =========================================================
 
 static bool prepare_fuid_tag(void) {
-    FURI_LOG_I(TAG, "FUID: wake+select");
-    if(!nfc_iso14443a_wake_and_select()) {
-        FURI_LOG_E(TAG, "FUID: wake failed");
-        return false;
-    }
-    FURI_LOG_I(TAG, "FUID: backdoor knock");
+    // Step 1: wake per assicurarsi che il tag sia nel campo RF
+    FURI_LOG_I(TAG, "FUID: initial wake");
+    nfc_iso14443a_wake_and_select(); // risultato ignorato, serve solo a caricare il tag
+
+    // Step 2: HALT per uscire da stato SELECTED
+    uint8_t halt[4] = {0x50, 0x00, 0x00, 0x00};
+    append_crc(halt, 2);
+    furi_thread_flags_clear(0xFFFFFFFF);
+    furi_hal_nfc_poller_tx(halt, 32);
+    furi_hal_nfc_poller_wait_event(30);
+    furi_delay_ms(10);
+
+    // Step 3: power cycle completo — il FUID risponde al knock solo a freddo
+    furi_hal_nfc_low_power_mode_start();
+    furi_delay_ms(20);
+    furi_hal_nfc_low_power_mode_stop();
+    furi_hal_nfc_set_mode(FuriHalNfcModePoller, FuriHalNfcTechIso14443a);
+    furi_hal_nfc_poller_field_on();
+    furi_delay_ms(60);
+
+    // Step 4: knock diretto senza select
+    FURI_LOG_I(TAG, "FUID: cold knock");
     if(!gen1_magic_knock()) {
         FURI_LOG_E(TAG, "FUID: knock failed");
         return false;
@@ -281,8 +297,7 @@ static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
         bool tag_ready = false;
 
         if(action_index == 0) {
-            // FUID: reset campo tra ogni tentativo, poi wake+select+knock
-            force_hardware_reset(40);
+            // FUID: wake → halt → power cycle → knock a freddo
             tag_ready = prepare_fuid_tag();
         } else {
             // UFUID: logica invariata
@@ -337,7 +352,7 @@ static void draw_callback(Canvas* canvas, void* ctx) {
     canvas_set_font(canvas, FontPrimary);
 
     if(context->state == AppMenu) {
-        canvas_draw_str_aligned(canvas, 64, 5, AlignCenter, AlignTop, "UFUID Sealer v15.0");
+        canvas_draw_str_aligned(canvas, 64, 5, AlignCenter, AlignTop, "UFUID Sealer v15.1");
         canvas_set_font(canvas, FontSecondary);
         for(uint8_t i = 0; i < 3; i++) {
             if(i == context->menu_index) {
