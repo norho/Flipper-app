@@ -86,42 +86,41 @@ static bool nfc_iso14443a_wake_and_select(void) {
 }
 
 // =========================================================
-// SEQUENZE BACKDOOR: GEN1 BRUTE FORCE (FIX HARDWARE)
+// SEQUENZE BACKDOOR (API PUBBLICHE)
 // =========================================================
 
-// Configura i timer hardware del chip in modalità raw
-static void nfc_set_custom_timeout_gen1(void) {
-    // 5000 FCWT (Frame Guard Time) = circa 5ms, perfetto per il knock 0x40
-    furi_hal_nfc_poller_set_data_timeout(5000);
-}
-
-// Nuova implementazione Knock usando la tx_rx nativa del Flipper (più stabile sui bit dispari)
 static bool gen1_magic_knock(void) {
     uint8_t rx[32];
     size_t  rx_bits = 0;
-    
-    // Comando raw a 7 bit (0x40)
     uint8_t c1 = 0x40;
     
-    nfc_set_custom_timeout_gen1();
+    furi_thread_flags_clear(0xFFFFFFFF);
     
-    // Usiamo il blocco tx_rx combinato nativo del FuriOS (molto più tollerante per i 7 bit)
-    furi_hal_nfc_poller_tx_rx(
-        &c1, 
-        7, 
-        rx, 
-        sizeof(rx), 
-        &rx_bits, 
-        150 // Timeout nativo in ms
-    );
-    
-    // Ripristina timeout standard ISO (circa 300ms equivalenti)
-    furi_hal_nfc_poller_set_data_timeout(0);
+    // Usiamo il comando standard compatibile con tutti gli header
+    if(furi_hal_nfc_poller_tx(&c1, 7) != FuriHalNfcErrorNone) return false;
 
-    // Cerca la risposta magica ACK (0x0A) a 4 bit
+    bool rx_success = false;
+    uint32_t start_time = furi_get_tick();
+    
+    // Attendiamo in modo flessibile fino a 200ms
+    while(furi_get_tick() - start_time < 200) {
+        FuriHalNfcEvent event = furi_hal_nfc_poller_wait_event(20);
+        
+        if(event & FuriHalNfcEventRxEnd) {
+            rx_success = true;
+            break;
+        }
+        
+        if((event & FuriHalNfcEventTimeout) && (furi_get_tick() - start_time > 150)) {
+            break;
+        }
+    }
+    
+    if(!rx_success) return false;
+    
+    if(furi_hal_nfc_poller_rx(rx, sizeof(rx), &rx_bits) != FuriHalNfcErrorNone) return false;
     if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
 
-    // Conferma sblocco
     uint8_t c2 = 0x43;
     if(!nfc_send_recv(&c2, 8, rx, sizeof(rx), &rx_bits)) return false;
     if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
@@ -136,6 +135,14 @@ static bool try_gen1_backdoor(void) {
 
 static bool try_gen1_wake_backdoor(void) {
     FURI_LOG_I(TAG, "TRY GEN1 WAKE");
+    uint8_t rx[32];
+    size_t rx_bits = 0;
+    uint8_t wupa = 0x52;
+    
+    nfc_send_recv(&wupa, 7, rx, sizeof(rx), &rx_bits);
+    furi_delay_ms(5);
+    nfc_send_recv(&wupa, 7, rx, sizeof(rx), &rx_bits);
+    
     if(!nfc_iso14443a_wake_and_select()) return false;
     return gen1_magic_knock();
 }
@@ -148,7 +155,6 @@ static bool try_gen1_proxmark_backdoor(void) {
     return gen1_magic_knock();
 }
 
-// UFUID Gen2 Intoccabile e Funzionante
 static bool try_gen2_backdoor(void) {
     uint8_t rx[32];
     size_t rx_bits = 0;
@@ -186,7 +192,6 @@ static bool prepare_fuid_tag(void) {
 }
 
 static bool prepare_ufuid_tag(void) {
-    // Pipeline Intoccabile per Gen2
     if(try_gen1_backdoor()) return true; 
     force_hardware_reset();
     if(try_gen2_backdoor()) return true;
@@ -360,7 +365,7 @@ static void draw_callback(Canvas* canvas, void* ctx) {
     canvas_set_font(canvas, FontPrimary);
 
     if(context->state == AppMenu) {
-        canvas_draw_str_aligned(canvas, 64, 5, AlignCenter, AlignTop, "UFUID Sealer v11.0");
+        canvas_draw_str_aligned(canvas, 64, 5, AlignCenter, AlignTop, "UFUID Sealer v12.0");
         canvas_set_font(canvas, FontSecondary);
         for(uint8_t i = 0; i < 3; i++) {
             if(i == context->menu_index) {
