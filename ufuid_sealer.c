@@ -118,7 +118,6 @@ static bool core_write_mifare_bin(const char* file_path, bool is_ufuid) {
 
     return true;
 }
-
 static bool seal_ufuid(void) {
     uint8_t rx[4];
     size_t rx_bits = 0;
@@ -157,30 +156,30 @@ typedef struct {
     FuriMessageQueue* event_queue;
 } AppContext;
 
-// Funzione hardware riscritta per abilitare correttamente l'HAL Poller
+// Funzione hardware riscritta con le API ufficiali
 static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
     bool result = false;
     if(furi_hal_nfc_is_hal_ready() != FuriHalNfcErrorNone) return false;
 
-    // Riserva ed inizializza la periferica radio
+    // Inizializza l'hardware radio
     furi_hal_nfc_acquire();
-    furi_hal_nfc_set_mode(FuriHalNfcModePoller, FuriHalNfcTechIso14443a);
-    
-    // FIX CRITICO: Accende esplicitamente l'emissione del campo e avvia il Poller dell'HAL
-    furi_hal_nfc_field_on();
-    furi_hal_nfc_poller_start();
-    furi_delay_ms(50); // Stabilizzazione del campo RF
+    furi_hal_nfc_low_power_mode_stop();
 
     uint32_t start_time = furi_get_tick();
     bool tag_ready = false;
 
     // Ciclo di aggancio tag (massimo 4 secondi)
     while(furi_get_tick() - start_time < 4000) {
+        // FIX: Riavvio del campo usando le API standard supportate
+        furi_hal_nfc_set_mode(FuriHalNfcModeOff, FuriHalNfcTechIso14443a);
+        furi_delay_ms(15);
+        furi_hal_nfc_set_mode(FuriHalNfcModePoller, FuriHalNfcTechIso14443a);
+        furi_delay_ms(15);
+
         if(nfc_iso14443a_wake_and_select()) {
             tag_ready = true;
             break;
         }
-        furi_delay_ms(50);
     }
 
     if(tag_ready) {
@@ -190,8 +189,7 @@ static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
     }
 
     // Spegnimento sicuro dell'antenna e rilascio
-    furi_hal_nfc_poller_stop();
-    furi_hal_nfc_field_off();
+    furi_hal_nfc_low_power_mode_start();
     furi_hal_nfc_release();
     return result;
 }
@@ -217,7 +215,7 @@ static void draw_callback(Canvas* canvas, void* ctx) {
     } else if(context->state == AppProcessing) {
         canvas_draw_str_aligned(canvas, 64, 25, AlignCenter, AlignCenter, "Avvicina il TAG...");
         canvas_set_font(canvas, FontSecondary);
-        canvas_draw_str_aligned(canvas, 64, 40, AlignCenter, AlignCenter, "Antenna attiva - LED verde");
+        canvas_draw_str_aligned(canvas, 64, 40, AlignCenter, AlignCenter, "Ricerca in corso...");
     } else if(context->state == AppSuccess) {
         canvas_draw_str_aligned(canvas, 64, 25, AlignCenter, AlignCenter, "SUCCESSO!");
         canvas_set_font(canvas, FontSecondary);
