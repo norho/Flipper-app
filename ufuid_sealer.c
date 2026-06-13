@@ -27,7 +27,6 @@ static void append_crc(uint8_t* data, size_t len) {
     data[len + 1] = (crc >> 8) & 0xFF;
 }
 
-// FIX PRINCIPALE: usa furi_hal_nfc_wait_event_common con loop
 static bool nfc_send_recv(
     uint8_t* tx,
     size_t tx_bits,
@@ -40,12 +39,11 @@ static bool nfc_send_recv(
     FuriHalNfcEvent event = 0;
     uint32_t timeout_ms = NFC_EVENT_TIMEOUT_MS;
 
-    // Loop di attesa evento come da codice ufficiale Flipper
     while(timeout_ms > 0) {
-        event = furi_hal_nfc_wait_event_common(10);
+        event = furi_hal_nfc_poller_wait_event(10);
         timeout_ms -= 10;
-        if(event & FuriHalNfcEventRxEnd) break;
-        if(event & FuriHalNfcEventTimeout) return false;
+        if(event & FuriHalNfcEventRxEnd)    break;
+        if(event & FuriHalNfcEventTimeout)  return false;
         if(event & FuriHalNfcEventCollision) return false;
     }
 
@@ -60,31 +58,27 @@ static bool nfc_iso14443a_wake_and_select(void) {
     uint8_t rx[32];
     size_t  rx_bits = 0;
 
-    // WUPA via funzione dedicata ISO14443a
     FuriHalNfcError err = furi_hal_nfc_iso14443a_poller_trx_short_frame(
         FuriHalNfcaShortFrameAllReq);
     if(err != FuriHalNfcErrorNone) return false;
 
-    // Attesa ATQA con loop
     FuriHalNfcEvent event = 0;
     uint32_t timeout_ms = 100;
     while(timeout_ms > 0) {
-        event = furi_hal_nfc_wait_event_common(10);
+        event = furi_hal_nfc_poller_wait_event(10);
         timeout_ms -= 10;
-        if(event & FuriHalNfcEventRxEnd) break;
+        if(event & FuriHalNfcEventRxEnd)   break;
         if(event & FuriHalNfcEventTimeout) return false;
     }
     if(timeout_ms == 0) return false;
 
     if(furi_hal_nfc_poller_rx(rx, sizeof(rx), &rx_bits) != FuriHalNfcErrorNone) return false;
-    if(rx_bits < 16) return false; // ATQA = 2 byte
+    if(rx_bits < 16) return false;
 
-    // Anti-collisione
     uint8_t anticoll[2] = {0x93, 0x20};
     if(!nfc_send_recv(anticoll, 16, rx, sizeof(rx), &rx_bits)) return false;
     if(rx_bits < 40) return false;
 
-    // Select
     uint8_t select_cmd[9];
     select_cmd[0] = 0x93;
     select_cmd[1] = 0x70;
@@ -103,16 +97,15 @@ static bool unlock_gen1_backdoor(void) {
     uint8_t rx[4];
     size_t  rx_bits = 0;
 
-    // 0x40 a 7 bit
     uint8_t c1 = 0x40;
     if(furi_hal_nfc_poller_tx(&c1, 7) != FuriHalNfcErrorNone) return false;
 
     FuriHalNfcEvent event = 0;
     uint32_t timeout_ms = 100;
     while(timeout_ms > 0) {
-        event = furi_hal_nfc_wait_event_common(10);
+        event = furi_hal_nfc_poller_wait_event(10);
         timeout_ms -= 10;
-        if(event & FuriHalNfcEventRxEnd) break;
+        if(event & FuriHalNfcEventRxEnd)   break;
         if(event & FuriHalNfcEventTimeout) return false;
     }
     if(timeout_ms == 0) return false;
@@ -120,7 +113,6 @@ static bool unlock_gen1_backdoor(void) {
     if(furi_hal_nfc_poller_rx(rx, sizeof(rx), &rx_bits) != FuriHalNfcErrorNone) return false;
     if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
 
-    // 0x43 a 8 bit
     uint8_t c2 = 0x43;
     if(!nfc_send_recv(&c2, 8, rx, sizeof(rx), &rx_bits)) return false;
     if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
@@ -160,7 +152,6 @@ static bool core_write_mifare_bin(const char* file_path) {
 
     if(bytes_read != 1024) return false;
 
-    // Blocchi 1-63 prima, blocco 0 per ultimo (anti-brick FUID)
     for(uint8_t i = 1; i < 64; i++) {
         if(!nfc_write_block(i, &dump[i * 16])) return false;
         furi_delay_ms(2);
