@@ -3,10 +3,10 @@
 #include <storage/storage.h>
 #include <gui/gui.h>
 #include <gui/elements.h>
+#include <dialogs/dialogs.h>
 #include <string.h>
 
 #define TAG "UFUID_Sealer"
-#define DUMP_FILE_PATH EXT_PATH("nfc/bambu_tag_dump.bin")
 
 // Helper: Calcolo e accodamento del CRC-A
 static void append_crc(uint8_t* data, size_t len) {
@@ -61,14 +61,14 @@ static bool nfc_write_block(uint8_t block_num, uint8_t* data) {
 }
 
 // =========================================================
-// MOTORE CONDIVISO
+// MOTORE CONDIVISO CON FILE PATH DINAMICO
 // =========================================================
-static bool core_write_mifare_bin(void) {
+static bool core_write_mifare_bin(const char* file_path) {
     Storage* storage = furi_record_open(RECORD_STORAGE);
     File* file = storage_file_alloc(storage);
     bool success = true;
 
-    if(storage_file_open(file, DUMP_FILE_PATH, FSAM_READ, FSOM_OPEN_EXISTING)) {
+    if(storage_file_open(file, file_path, FSAM_READ, FSOM_OPEN_EXISTING)) {
         uint8_t block_data[16];
         uint8_t block0_data[16]; 
         uint8_t block_num = 0;
@@ -94,7 +94,7 @@ static bool core_write_mifare_bin(void) {
             }
         }
     } else {
-        FURI_LOG_E(TAG, "File non trovato: %s", DUMP_FILE_PATH);
+        FURI_LOG_E(TAG, "File non trovato: %s", file_path);
         success = false;
     }
 
@@ -107,12 +107,12 @@ static bool core_write_mifare_bin(void) {
 // =========================================================
 // WRAPPER LOGICI E FUNZIONI NFC
 // =========================================================
-static bool write_fuid(void) {
-    return core_write_mifare_bin();
+static bool write_fuid(const char* file_path) {
+    return core_write_mifare_bin(file_path);
 }
 
-static bool write_ufuid(void) {
-    return core_write_mifare_bin();
+static bool write_ufuid(const char* file_path) {
+    return core_write_mifare_bin(file_path);
 }
 
 static bool seal_ufuid(void) {
@@ -157,7 +157,7 @@ typedef struct {
 } AppContext;
 
 // Funzione helper per l'esecuzione hardware isolata
-static bool execute_nfc_action(uint8_t action_index) {
+static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
     bool result = false;
     if(furi_hal_nfc_is_hal_ready() != FuriHalNfcErrorNone) return false;
 
@@ -166,8 +166,8 @@ static bool execute_nfc_action(uint8_t action_index) {
     furi_hal_nfc_set_mode(FuriHalNfcModePoller, FuriHalNfcTechIso14443a);
     furi_delay_ms(1500); // Attesa fisiologica per stabilizzare il tag nel campo
 
-    if(action_index == 0) result = write_fuid();
-    else if(action_index == 1) result = write_ufuid();
+    if(action_index == 0) result = write_fuid(file_path);
+    else if(action_index == 1) result = write_ufuid(file_path);
     else if(action_index == 2) result = seal_ufuid();
 
     furi_hal_nfc_low_power_mode_start();
@@ -252,16 +252,37 @@ int32_t ufuid_sealer_app(void* p) {
                     } else if(event.key == InputKeyDown) {
                         if(context->menu_index < 2) context->menu_index++;
                     } else if(event.key == InputKeyOk) {
-                        // Cambia la schermata in "Attendere" prima di avviare l'hardware
-                        context->state = AppProcessing;
-                        view_port_update(view_port);
                         
-                        // Avvia il blocco hardware NFC
-                        bool success = execute_nfc_action(context->menu_index);
+                        bool go_ahead = true;
+                        FuriString* file_path = furi_string_alloc();
                         
-                        // Terminato l'hardware, mostra il risultato
-                        context->state = success ? AppSuccess : AppError;
-                        view_port_update(view_port);
+                        // Avvia il File Browser se l'utente deve selezionare un file (Azione 1 o 2)
+                        if (context->menu_index == 0 || context->menu_index == 1) {
+                            furi_string_set(file_path, EXT_PATH("nfc"));
+                            
+                            DialogsApp* dialogs = furi_record_open(RECORD_DIALOGS);
+                            DialogsFileBrowserOptions browser_options;
+                            dialog_file_browser_set_basic_options(&browser_options, ".bin", NULL);
+                            browser_options.base_path = EXT_PATH("nfc");
+                            
+                            // Mostra l'esplora risorse. Se l'utente preme BACK nel browser, ritorna false
+                            go_ahead = dialog_file_browser_show(dialogs, file_path, file_path, &browser_options);
+                            furi_record_close(RECORD_DIALOGS);
+                        }
+
+                        // Se l'utente ha scelto un file (o se ha scelto "Sigilla"), proseguiamo
+                        if (go_ahead) {
+                            context->state = AppProcessing;
+                            view_port_update(view_port);
+                            
+                            // Esegue l'azione NFC vera e propria
+                            bool success = execute_nfc_action(context->menu_index, furi_string_get_cstr(file_path));
+                            
+                            context->state = success ? AppSuccess : AppError;
+                            view_port_update(view_port);
+                        }
+                        
+                        furi_string_free(file_path);
                     }
                 } else if(context->state == AppSuccess || context->state == AppError) {
                     if(event.key == InputKeyBack || event.key == InputKeyOk) {
