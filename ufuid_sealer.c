@@ -64,8 +64,6 @@ static void force_hardware_reset(void) {
     furi_hal_nfc_low_power_mode_stop();  
     furi_hal_nfc_set_mode(FuriHalNfcModePoller, FuriHalNfcTechIso14443a);
     furi_hal_nfc_poller_field_on(); 
-    
-    // FIX: Raddoppiato il tempo di carica condensatori RF per i FUID ostinati
     furi_delay_ms(80); 
 }
 
@@ -88,17 +86,41 @@ static bool nfc_iso14443a_wake_and_select(void) {
 }
 
 // =========================================================
-// SEQUENZE BACKDOOR BASE
+// SEQUENZE BACKDOOR (FIX RAW GEN1)
 // =========================================================
 
-static bool try_gen1_backdoor(void) {
+// Funzione dedicata con sonde diagnostiche profonde per il comando 0x40
+static bool gen1_magic_knock(void) {
     uint8_t rx[32];
     size_t  rx_bits = 0;
-
-    FURI_LOG_I(TAG, "TRY BACKDOOR GEN1 COLD");
     uint8_t c1 = 0x40;
     
-    if(!nfc_send_recv(&c1, 7, rx, sizeof(rx), &rx_bits)) return false;
+    furi_thread_flags_clear(0xFFFFFFFF);
+    if(furi_hal_nfc_poller_tx(&c1, 7) != FuriHalNfcErrorNone) {
+        FURI_LOG_E(TAG, "Knock 0x40 TX Fail");
+        return false;
+    }
+
+    bool rx_success = false;
+    uint32_t start_time = furi_get_tick();
+    
+    while(furi_get_tick() - start_time < 150) {
+        FuriHalNfcEvent event = furi_hal_nfc_poller_wait_event(20);
+        if (event != 0) {
+            FURI_LOG_I(TAG, "Knock EVT: 0x%08lx", (uint32_t)event);
+        }
+        if(event & FuriHalNfcEventRxEnd) {
+            rx_success = true;
+            break;
+        }
+        if((event & FuriHalNfcEventTimeout) && !(event & FuriHalNfcEventRxEnd)) break;
+    }
+    
+    if(!rx_success) return false;
+    
+    if(furi_hal_nfc_poller_rx(rx, sizeof(rx), &rx_bits) != FuriHalNfcErrorNone) return false;
+    FURI_LOG_I(TAG, "Knock RX: %zu bits, Val: 0x%02X", rx_bits, rx[0]);
+    
     if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
 
     uint8_t c2 = 0x43;
@@ -106,55 +128,33 @@ static bool try_gen1_backdoor(void) {
     if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
 
     return true;
+}
+
+static bool try_gen1_backdoor(void) {
+    FURI_LOG_I(TAG, "TRY GEN1 COLD");
+    return gen1_magic_knock();
 }
 
 static bool try_gen1_wake_backdoor(void) {
-    uint8_t rx[32];
-    size_t  rx_bits = 0;
-
-    FURI_LOG_I(TAG, "TRY BACKDOOR GEN1 WAKE");
+    FURI_LOG_I(TAG, "TRY GEN1 WAKE");
     if(!nfc_iso14443a_wake_and_select()) return false;
-
-    uint8_t c1 = 0x40;
-    if(!nfc_send_recv(&c1, 7, rx, sizeof(rx), &rx_bits)) return false;
-    if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
-
-    uint8_t c2 = 0x43;
-    if(!nfc_send_recv(&c2, 8, rx, sizeof(rx), &rx_bits)) return false;
-    if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
-
-    return true;
+    return gen1_magic_knock();
 }
 
-// FIX: Sequenza stile Proxmark3 per cloni che richiedono l'Halt logico per entrare in backdoor
 static bool try_gen1_proxmark_backdoor(void) {
-    uint8_t rx[32];
-    size_t  rx_bits = 0;
-
-    FURI_LOG_I(TAG, "TRY BACKDOOR GEN1 PROXMARK");
+    FURI_LOG_I(TAG, "TRY GEN1 PROXMARK");
     if(!nfc_iso14443a_wake_and_select()) return false;
-    
     nfc_send_halt_only();
-    
-    // Attendiamo 20ms ma NON spegniamo il campo (il chip resta alimentato ma in stato Halt)
     furi_delay_ms(20); 
-
-    uint8_t c1 = 0x40;
-    if(!nfc_send_recv(&c1, 7, rx, sizeof(rx), &rx_bits)) return false;
-    if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
-
-    uint8_t c2 = 0x43;
-    if(!nfc_send_recv(&c2, 8, rx, sizeof(rx), &rx_bits)) return false;
-    if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
-
-    return true;
+    return gen1_magic_knock();
 }
 
+// UFUID Gen2 Intoccabile e Funzionante
 static bool try_gen2_backdoor(void) {
     uint8_t rx[32];
     size_t rx_bits = 0;
 
-    FURI_LOG_I(TAG, "TRY BACKDOOR GEN2 (UFUID)");
+    FURI_LOG_I(TAG, "TRY GEN2 (UFUID)");
     if(!nfc_iso14443a_wake_and_select()) return false;
 
     uint8_t auth_cmd[] = {0x60, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00};
@@ -174,30 +174,25 @@ static bool try_gen2_backdoor(void) {
 }
 
 // =========================================================
-// MOTORI ISOLATI (FUID e UFUID)
+// MOTORI ISOLATI
 // =========================================================
 
 static bool prepare_fuid_tag(void) {
     if(try_gen1_backdoor()) return true;
-
     force_hardware_reset();
     if(try_gen1_wake_backdoor()) return true;
-
     force_hardware_reset();
     if(try_gen1_proxmark_backdoor()) return true;
-
     return false;
 }
 
 static bool prepare_ufuid_tag(void) {
-    if(try_gen1_backdoor()) return true;
-
+    // Pipeline Intoccabile
+    if(try_gen1_backdoor()) return true; // C'è un piccolo test Gen1 di default
     force_hardware_reset();
     if(try_gen2_backdoor()) return true;
-
     force_hardware_reset();
     if(try_gen1_proxmark_backdoor()) return true;
-    
     return false;
 }
 // =========================================================
@@ -309,8 +304,6 @@ static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
     furi_hal_nfc_low_power_mode_stop();
     furi_hal_nfc_set_mode(FuriHalNfcModePoller, FuriHalNfcTechIso14443a);
     furi_hal_nfc_poller_field_on();
-    
-    // FIX: Ricarica profonda all'avvio del ciclo
     furi_delay_ms(80);
 
     uint32_t start_time = furi_get_tick();
@@ -368,7 +361,7 @@ static void draw_callback(Canvas* canvas, void* ctx) {
     canvas_set_font(canvas, FontPrimary);
 
     if(context->state == AppMenu) {
-        canvas_draw_str_aligned(canvas, 64, 5, AlignCenter, AlignTop, "UFUID Sealer v8.0");
+        canvas_draw_str_aligned(canvas, 64, 5, AlignCenter, AlignTop, "UFUID Sealer v9.0");
         canvas_set_font(canvas, FontSecondary);
         for(uint8_t i = 0; i < 3; i++) {
             if(i == context->menu_index) {
