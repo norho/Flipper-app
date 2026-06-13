@@ -11,6 +11,22 @@
 #define TAG "UFUID_Sealer"
 
 // =========================================================
+// STRUTTURE DATI GLOBALI (Thread Shared)
+// =========================================================
+
+typedef enum { AppMenu, AppProcessing, AppSuccess, AppError } AppState;
+
+typedef struct {
+    AppState          state;
+    uint8_t           menu_index;
+    const char* menu_items[3];
+    FuriMessageQueue* event_queue;
+    char              file_path[256];
+    bool              worker_running;
+    FuriThread* worker_thread;
+} AppContext;
+
+// =========================================================
 // HELPER E PROTOCOLLI RADIO ISO14443A
 // =========================================================
 
@@ -26,29 +42,25 @@ static void append_crc(uint8_t* data, size_t len) {
     data[len + 1] = (crc >> 8) & 0xFF;
 }
 
-// FIX CRITICO: Aspetta correttamente RxEnd ignorando l'evento intermedio TxEnd (0x20)
 static bool nfc_send_recv(uint8_t* tx, size_t tx_bits, uint8_t* rx, size_t rx_max, size_t* rx_bits) {
     furi_thread_flags_clear(0xFFFFFFFF);
     if(furi_hal_nfc_poller_tx(tx, tx_bits) != FuriHalNfcErrorNone) return false;
 
-    bool rx_success = false;
-    uint32_t start_time = furi_get_tick();
-    
-    // Loop sicuro di attesa attiva (Max 150ms)
-    while(furi_get_tick() - start_time < 150) {
-        FuriHalNfcEvent event = furi_hal_nfc_poller_wait_event(20);
+    FuriHalNfcEvent event = 0;
+    uint32_t timeout_ms = 150;
+    while(timeout_ms > 0) {
+        event = furi_hal_nfc_poller_wait_event(10);
+        timeout_ms -= 10;
         
-        if(event & FuriHalNfcEventRxEnd) {
-            rx_success = true;
-            break;
+        if (event != 0) {
+            FURI_LOG_I(TAG, "SEND_RECV EVENT=0x%08lx", (uint32_t)event);
         }
-        if(event & FuriHalNfcEventTimeout) {
-            break; // Timeout reale, usciamo
-        }
-        // Se riceve 0x20 (TxEnd) o 0 (Nessun evento in questi 20ms), il loop continua!
-    }
 
-    if(!rx_success) return false;
+        if(event & FuriHalNfcEventRxEnd) break;
+        if(event & FuriHalNfcEventTimeout) return false;
+        if(event & FuriHalNfcEventCollision) return false;
+    }
+    if(timeout_ms == 0) return false;
 
     if(furi_hal_nfc_poller_rx(rx, rx_max, rx_bits) != FuriHalNfcErrorNone) return false;
     return (*rx_bits > 0);
@@ -57,19 +69,16 @@ static bool nfc_send_recv(uint8_t* tx, size_t tx_bits, uint8_t* rx, size_t rx_ma
 static void nfc_send_halt_only(void) {
     uint8_t halt[4] = {0x50, 0x00, 0x00, 0x00};
     append_crc(halt, 2);
-    furi_thread_flags_clear(0xFFFFFFFF);
     furi_hal_nfc_poller_tx(halt, 32);
-    furi_hal_nfc_poller_wait_event(20); // Aspetta solo che la trasmissione finisca
+    furi_delay_ms(5); 
 }
 
-// FIX CRITICO: Ripristinato field_on() per non lasciare il tag senza corrente
-static void force_hardware_reset(void) {
+static void reset_nfc_poller(void) {
     furi_hal_nfc_low_power_mode_start(); 
-    furi_delay_ms(15);
+    furi_delay_ms(10);
     furi_hal_nfc_low_power_mode_stop();  
     furi_hal_nfc_set_mode(FuriHalNfcModePoller, FuriHalNfcTechIso14443a);
-    furi_hal_nfc_poller_field_on(); 
-    furi_delay_ms(40); // Tempo obbligatorio per ricaricare il tag RF
+    furi_delay_ms(10);
 }
 
 static bool nfc_iso14443a_wake_and_select(void) {
@@ -82,6 +91,7 @@ static bool nfc_iso14443a_wake_and_select(void) {
     uint8_t anticoll[2] = {0x93, 0x20};
     if(!nfc_send_recv(anticoll, 16, rx, sizeof(rx), &rx_bits)) return false;
     
+    FURI_LOG_I(TAG, "ANTICOLL RX_BITS=%zu", rx_bits);
     if(rx_bits < 32) return false; 
 
     uint8_t select_cmd[9] = {0x93, 0x70, rx[0], rx[1], rx[2], rx[3], rx[4], 0, 0};
@@ -99,27 +109,23 @@ static bool try_gen1_backdoor(void) {
     uint8_t rx[32];
     size_t  rx_bits = 0;
 
+    FURI_LOG_I(TAG, "TRY BACKDOOR GEN1");
     uint8_t c1 = 0x40;
-    
-    furi_thread_flags_clear(0xFFFFFFFF);
     if(furi_hal_nfc_poller_tx(&c1, 7) != FuriHalNfcErrorNone) return false;
 
-    bool rx_success = false;
-    uint32_t start_time = furi_get_tick();
-    
-    // Loop sicuro applicato anche alla backdoor
-    while(furi_get_tick() - start_time < 150) {
-        FuriHalNfcEvent event = furi_hal_nfc_poller_wait_event(20);
-        if(event & FuriHalNfcEventRxEnd) {
-            rx_success = true;
-            break;
-        }
-        if(event & FuriHalNfcEventTimeout) break;
+    FuriHalNfcEvent event = 0;
+    uint32_t timeout_ms = 100;
+    while(timeout_ms > 0) {
+        event = furi_hal_nfc_poller_wait_event(10);
+        timeout_ms -= 10;
+        if (event != 0) FURI_LOG_I(TAG, "40 EVENT=0x%08lx", (uint32_t)event);
+        if(event & FuriHalNfcEventRxEnd) break;
     }
     
-    if(!rx_success) return false;
-    
+    if(timeout_ms == 0) return false;
     if(furi_hal_nfc_poller_rx(rx, sizeof(rx), &rx_bits) != FuriHalNfcErrorNone) return false;
+    
+    FURI_LOG_I(TAG, "40 RX_BITS=%zu", rx_bits);
     if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
 
     uint8_t c2 = 0x43;
@@ -133,6 +139,7 @@ static bool try_gen2_backdoor(void) {
     uint8_t rx[32];
     size_t rx_bits = 0;
 
+    FURI_LOG_I(TAG, "TRY BACKDOOR GEN2");
     if(!nfc_iso14443a_wake_and_select()) return false;
 
     uint8_t auth_cmd[] = {0x60, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00};
@@ -155,15 +162,16 @@ static bool try_gen2_backdoor(void) {
 static bool prepare_magic_tag(void) {
     if(try_gen1_backdoor()) return true;
 
-    force_hardware_reset();
+    reset_nfc_poller();
     if(try_gen2_backdoor()) return true;
 
-    force_hardware_reset();
+    reset_nfc_poller();
     if(nfc_iso14443a_wake_and_select()) {
         nfc_send_halt_only();
-        force_hardware_reset();
+        reset_nfc_poller();
         if(try_gen1_backdoor()) return true;
     }
+    
     return false;
 }
 // =========================================================
@@ -250,11 +258,14 @@ static bool seal_ufuid(void) {
 }
 
 // =========================================================
-// ESECUZIONE NFC PRINCIPALE
+// THREAD WORKER NFC INDIPENDENTE (FIX LOCKUP)
 // =========================================================
 
-static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
+static int32_t nfc_worker_thread(void* thread_context) {
+    AppContext* context = thread_context;
     bool result = false;
+
+    FURI_LOG_I(TAG, "Worker Thread Partito");
 
     NotificationApp* notifications = furi_record_open(RECORD_NOTIFICATION);
     notification_message(notifications, &sequence_blink_start_cyan);
@@ -263,20 +274,20 @@ static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
     furi_hal_nfc_low_power_mode_stop();
     furi_hal_nfc_set_mode(FuriHalNfcModePoller, FuriHalNfcTechIso14443a);
     furi_hal_nfc_poller_field_on();
-    furi_delay_ms(40); 
 
     uint32_t start_time = furi_get_tick();
 
-    while(furi_get_tick() - start_time < 5000) {
+    // Loop radio asincrono da 5 secondi
+    while((furi_get_tick() - start_time < 5000) && context->worker_running) {
         if(prepare_magic_tag()) {
-            if(action_index == 0 || action_index == 1) {
-                result = core_write_mifare_bin(file_path);
-            } else if(action_index == 2) {
+            if(context->menu_index == 0 || context->menu_index == 1) {
+                result = core_write_mifare_bin(context->file_path);
+            } else if(context->menu_index == 2) {
                 result = seal_ufuid();
             }
             break; 
         }
-        furi_delay_ms(50);
+        furi_delay_ms(100);
     }
 
     furi_hal_nfc_low_power_mode_start();
@@ -290,21 +301,19 @@ static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
     }
     furi_record_close(RECORD_NOTIFICATION);
 
-    return result;
+    // Usa l'event queue per avvisare la GUI che il lavoro ha finito, e qual è stato il risultato
+    InputEvent result_event;
+    result_event.type = InputTypeShort;
+    result_event.key = result ? InputKeyOk : InputKeyBack; // Trucco sporco ma pulito: Ok = Successo, Back = Errore logico
+    furi_message_queue_put(context->event_queue, &result_event, FuriWaitForever);
+
+    context->worker_running = false;
+    return 0;
 }
 
 // =========================================================
 // GUI E ENTRY POINT
 // =========================================================
-
-typedef enum { AppMenu, AppProcessing, AppSuccess, AppError } AppState;
-
-typedef struct {
-    AppState          state;
-    uint8_t           menu_index;
-    const char* menu_items[3];
-    FuriMessageQueue* event_queue;
-} AppContext;
 
 static void draw_callback(Canvas* canvas, void* ctx) {
     AppContext* context = ctx;
@@ -312,7 +321,7 @@ static void draw_callback(Canvas* canvas, void* ctx) {
     canvas_set_font(canvas, FontPrimary);
 
     if(context->state == AppMenu) {
-        canvas_draw_str_aligned(canvas, 64, 5, AlignCenter, AlignTop, "UFUID Sealer v3.0");
+        canvas_draw_str_aligned(canvas, 64, 5, AlignCenter, AlignTop, "UFUID Sealer v4.0");
         canvas_set_font(canvas, FontSecondary);
         for(uint8_t i = 0; i < 3; i++) {
             if(i == context->menu_index) {
@@ -336,7 +345,7 @@ static void draw_callback(Canvas* canvas, void* ctx) {
     } else if(context->state == AppError) {
         canvas_draw_str_aligned(canvas, 64, 20, AlignCenter, AlignCenter, "ERRORE");
         canvas_set_font(canvas, FontSecondary);
-        canvas_draw_str_aligned(canvas, 64, 35, AlignCenter, AlignCenter, "Tag non letto o fallito");
+        canvas_draw_str_aligned(canvas, 64, 35, AlignCenter, AlignCenter, "Leggi log (qFlipper)");
         canvas_draw_str_aligned(canvas, 64, 45, AlignCenter, AlignCenter, "Riprova e tieni fermo.");
         canvas_draw_str_aligned(canvas, 64, 55, AlignCenter, AlignCenter, "Premi BACK");
     }
@@ -350,13 +359,15 @@ static void input_callback(InputEvent* input_event, void* ctx) {
 int32_t ufuid_sealer_app(void* p) {
     UNUSED(p);
 
-    AppContext* context    = malloc(sizeof(AppContext));
-    context->state         = AppMenu;
-    context->menu_index    = 0;
+    AppContext* context = malloc(sizeof(AppContext));
+    context->state = AppMenu;
+    context->menu_index = 0;
     context->menu_items[0] = "1. Scrivi tag FUID";
     context->menu_items[1] = "2. Scrivi tag UFUID";
     context->menu_items[2] = "3. Sigilla tag UFUID";
-    context->event_queue   = furi_message_queue_alloc(8, sizeof(InputEvent));
+    context->event_queue = furi_message_queue_alloc(8, sizeof(InputEvent));
+    context->worker_running = false;
+    context->worker_thread = furi_thread_alloc_ex("NFCWorker", 2048, nfc_worker_thread, context);
 
     ViewPort* view_port = view_port_alloc();
     view_port_draw_callback_set(view_port, draw_callback, context);
@@ -366,10 +377,19 @@ int32_t ufuid_sealer_app(void* p) {
     gui_add_view_port(gui, view_port, GuiLayerFullscreen);
 
     InputEvent event;
-    bool       running = true;
+    bool running = true;
 
     while(running) {
         if(furi_message_queue_get(context->event_queue, &event, 100) == FuriStatusOk) {
+            
+            // Gestione dei messaggi finti mandati dal Worker Thread
+            if(context->state == AppProcessing && !context->worker_running) {
+                // Il worker ha finito. Leggiamo il risultato mascherato nei tasti Ok o Back
+                context->state = (event.key == InputKeyOk) ? AppSuccess : AppError;
+                view_port_update(view_port);
+                continue; // Saltiamo l'input reale finché l'utente non preme qualcosa nella schermata esito
+            }
+
             if(event.type == InputTypeShort) {
                 if(context->state == AppMenu) {
                     if(event.key == InputKeyBack) {
@@ -379,27 +399,32 @@ int32_t ufuid_sealer_app(void* p) {
                     } else if(event.key == InputKeyDown) {
                         if(context->menu_index < 2) context->menu_index++;
                     } else if(event.key == InputKeyOk) {
-                        bool        go_ahead  = true;
-                        FuriString* file_path = furi_string_alloc();
+                        bool go_ahead = true;
 
                         if(context->menu_index == 0 || context->menu_index == 1) {
+                            FuriString* file_path = furi_string_alloc();
                             furi_string_set(file_path, EXT_PATH("nfc"));
                             DialogsApp* dialogs = furi_record_open(RECORD_DIALOGS);
                             DialogsFileBrowserOptions browser_options;
                             dialog_file_browser_set_basic_options(&browser_options, ".bin", NULL);
                             browser_options.base_path = EXT_PATH("nfc");
                             go_ahead = dialog_file_browser_show(dialogs, file_path, file_path, &browser_options);
+                            
+                            if(go_ahead) {
+                                strncpy(context->file_path, furi_string_get_cstr(file_path), sizeof(context->file_path) - 1);
+                            }
+                            
                             furi_record_close(RECORD_DIALOGS);
+                            furi_string_free(file_path);
                         }
 
                         if(go_ahead) {
+                            // Partenza ufficiale dell'interfaccia e del background worker
                             context->state = AppProcessing;
-                            view_port_update(view_port);
-                            bool success = execute_nfc_action(context->menu_index, furi_string_get_cstr(file_path));
-                            context->state = success ? AppSuccess : AppError;
+                            context->worker_running = true;
+                            furi_thread_start(context->worker_thread);
                             view_port_update(view_port);
                         }
-                        furi_string_free(file_path);
                     }
                 } else if(context->state == AppSuccess || context->state == AppError) {
                     if(event.key == InputKeyBack || event.key == InputKeyOk) {
@@ -408,12 +433,23 @@ int32_t ufuid_sealer_app(void* p) {
                     }
                 }
             } else if(event.type == InputTypeLong && event.key == InputKeyBack) {
-                running = false;
+                if(context->state != AppProcessing) {
+                    running = false;
+                } else {
+                    // Terminazione forzata se l'utente si è stufato di aspettare il tag
+                    context->worker_running = false; 
+                }
             }
         }
         view_port_update(view_port);
     }
 
+    if(context->worker_running) {
+        context->worker_running = false;
+        furi_thread_join(context->worker_thread);
+    }
+
+    furi_thread_free(context->worker_thread);
     gui_remove_view_port(gui, view_port);
     view_port_free(view_port);
     furi_message_queue_free(context->event_queue);
