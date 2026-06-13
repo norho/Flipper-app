@@ -11,6 +11,23 @@
 #define TAG "UFUID_Sealer"
 
 // =========================================================
+// STRUTTURE DATI GLOBALI (Thread Shared)
+// =========================================================
+
+typedef enum { AppMenu, AppProcessing, AppSuccess, AppError } AppState;
+
+typedef struct {
+    AppState          state;
+    uint8_t           menu_index;
+    const char* menu_items[3];
+    FuriMessageQueue* event_queue;
+    char              file_path[256];
+    bool              worker_running;
+    bool              worker_success;
+    FuriThread* worker_thread;
+} AppContext;
+
+// =========================================================
 // HELPER E PROTOCOLLI RADIO ISO14443A
 // =========================================================
 
@@ -26,7 +43,7 @@ static void append_crc(uint8_t* data, size_t len) {
     data[len + 1] = (crc >> 8) & 0xFF;
 }
 
-// FIX: Parsing flessibile degli eventi compositi (es. 0xE0, 0xC0)
+// FIX: Parsing flessibile che ignora TxEnd (0x20) e aspetta RxEnd
 static bool nfc_send_recv(uint8_t* tx, size_t tx_bits, uint8_t* rx, size_t rx_max, size_t* rx_bits) {
     furi_thread_flags_clear(0xFFFFFFFF);
     if(furi_hal_nfc_poller_tx(tx, tx_bits) != FuriHalNfcErrorNone) return false;
@@ -37,15 +54,11 @@ static bool nfc_send_recv(uint8_t* tx, size_t tx_bits, uint8_t* rx, size_t rx_ma
     while(furi_get_tick() - start_time < 150) {
         FuriHalNfcEvent event = furi_hal_nfc_poller_wait_event(20);
         
-        // FURI_LOG_I(TAG, "EVENT=0x%08lx", (uint32_t)event); // Decommentare se serve ancora debug
-
-        // Finché c'è il bit RxEnd (indipendentemente dagli altri), consideriamolo un successo!
         if(event & FuriHalNfcEventRxEnd) {
             rx_success = true;
             break;
         }
         
-        // Timeout puro senza ricezione
         if((event & FuriHalNfcEventTimeout) && !(event & FuriHalNfcEventRxEnd)) {
             break; 
         }
@@ -100,6 +113,7 @@ static bool try_gen1_backdoor(void) {
     uint8_t rx[32];
     size_t  rx_bits = 0;
 
+    FURI_LOG_I(TAG, "TRY BACKDOOR GEN1");
     uint8_t c1 = 0x40;
     
     furi_thread_flags_clear(0xFFFFFFFF);
@@ -133,6 +147,7 @@ static bool try_gen2_backdoor(void) {
     uint8_t rx[32];
     size_t rx_bits = 0;
 
+    FURI_LOG_I(TAG, "TRY BACKDOOR GEN2");
     if(!nfc_iso14443a_wake_and_select()) return false;
 
     uint8_t auth_cmd[] = {0x60, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00};
@@ -167,25 +182,21 @@ static bool prepare_magic_tag(void) {
     return false;
 }
 // =========================================================
-// MOTORE DI SCRITTURA (FIX CRC/RAW DATA) E SIGILLATURA
+// MOTORE DI SCRITTURA E SIGILLATURA
 // =========================================================
 
 static bool nfc_write_block(uint8_t block_num, uint8_t* data) {
     uint8_t rx[32];
     size_t  rx_bits = 0;
 
-    // Comando Write (0xA0) richiede il CRC
     uint8_t cmd[4] = {0xA0, block_num, 0, 0};
     append_crc(cmd, 2);
     if(!nfc_send_recv(cmd, 32, rx, sizeof(rx), &rx_bits)) return false;
     if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
 
-    // FIX: Modalità backdoor, scriviamo i 16 byte netti + CRC standard ISO
     uint8_t write_data[18];
     memcpy(write_data, data, 16);
     append_crc(write_data, 16);
-    
-    // Inoltro del pacchetto da 144 bit (16 byte di payload + 2 byte CRC)
     if(!nfc_send_recv(write_data, 144, rx, sizeof(rx), &rx_bits)) return false;
 
     return (rx_bits >= 4 && (rx[0] & 0x0F) == 0x0A);
@@ -221,7 +232,7 @@ static bool core_write_mifare_bin(const char* file_path) {
             success = false;
             break;
         }
-        furi_delay_ms(5); // Pausa maggiorata per assorbimento flash NAND del tag
+        furi_delay_ms(5);
     }
     
     if(success) {
@@ -254,24 +265,14 @@ static bool seal_ufuid(void) {
 }
 
 // =========================================================
-// THREAD WORKER NFC E GUI
+// THREAD WORKER NFC INDIPENDENTE (ANTI-LOCKUP)
 // =========================================================
-
-typedef enum { AppMenu, AppProcessing, AppSuccess, AppError } AppState;
-
-typedef struct {
-    AppState          state;
-    uint8_t           menu_index;
-    const char* menu_items[3];
-    FuriMessageQueue* event_queue;
-    char              file_path[256];
-    bool              worker_running;
-    FuriThread* worker_thread;
-} AppContext;
 
 static int32_t nfc_worker_thread(void* thread_context) {
     AppContext* context = thread_context;
     bool result = false;
+
+    FURI_LOG_I(TAG, "Worker Thread Partito");
 
     NotificationApp* notifications = furi_record_open(RECORD_NOTIFICATION);
     notification_message(notifications, &sequence_blink_start_cyan);
@@ -306,14 +307,21 @@ static int32_t nfc_worker_thread(void* thread_context) {
     }
     furi_record_close(RECORD_NOTIFICATION);
 
+    // Comunica alla GUI che il lavoro è finito
+    context->worker_success = result;
+    context->worker_running = false;
+    
     InputEvent result_event;
     result_event.type = InputTypeShort;
-    result_event.key = result ? InputKeyOk : InputKeyBack; 
+    result_event.key = InputKeyMAX; 
     furi_message_queue_put(context->event_queue, &result_event, FuriWaitForever);
 
-    context->worker_running = false;
     return 0;
 }
+
+// =========================================================
+// GUI E ENTRY POINT
+// =========================================================
 
 static void draw_callback(Canvas* canvas, void* ctx) {
     AppContext* context = ctx;
@@ -321,7 +329,7 @@ static void draw_callback(Canvas* canvas, void* ctx) {
     canvas_set_font(canvas, FontPrimary);
 
     if(context->state == AppMenu) {
-        canvas_draw_str_aligned(canvas, 64, 5, AlignCenter, AlignTop, "UFUID Sealer v5.0");
+        canvas_draw_str_aligned(canvas, 64, 5, AlignCenter, AlignTop, "UFUID Sealer v6.0");
         canvas_set_font(canvas, FontSecondary);
         for(uint8_t i = 0; i < 3; i++) {
             if(i == context->menu_index) {
@@ -345,7 +353,7 @@ static void draw_callback(Canvas* canvas, void* ctx) {
     } else if(context->state == AppError) {
         canvas_draw_str_aligned(canvas, 64, 20, AlignCenter, AlignCenter, "ERRORE");
         canvas_set_font(canvas, FontSecondary);
-        canvas_draw_str_aligned(canvas, 64, 35, AlignCenter, AlignCenter, "Scrittura Fallita");
+        canvas_draw_str_aligned(canvas, 64, 35, AlignCenter, AlignCenter, "Tag non letto o fallito");
         canvas_draw_str_aligned(canvas, 64, 45, AlignCenter, AlignCenter, "Riprova e tieni fermo.");
         canvas_draw_str_aligned(canvas, 64, 55, AlignCenter, AlignCenter, "Premi BACK");
     }
@@ -382,8 +390,9 @@ int32_t ufuid_sealer_app(void* p) {
     while(running) {
         if(furi_message_queue_get(context->event_queue, &event, 100) == FuriStatusOk) {
             
+            // Gestione dei messaggi di ritorno dal Worker Thread
             if(context->state == AppProcessing && !context->worker_running) {
-                context->state = (event.key == InputKeyOk) ? AppSuccess : AppError;
+                context->state = context->worker_success ? AppSuccess : AppError;
                 view_port_update(view_port);
                 continue; 
             }
