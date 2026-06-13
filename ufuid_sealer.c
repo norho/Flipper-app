@@ -26,24 +26,32 @@ static void append_crc(uint8_t* data, size_t len) {
     data[len + 1] = (crc >> 8) & 0xFF;
 }
 
+// FIX CRITICO: Aspetta correttamente RxEnd ignorando l'evento intermedio TxEnd (0x20)
 static bool nfc_send_recv(uint8_t* tx, size_t tx_bits, uint8_t* rx, size_t rx_max, size_t* rx_bits) {
     furi_thread_flags_clear(0xFFFFFFFF);
+    if(furi_hal_nfc_poller_tx(tx, tx_bits) != FuriHalNfcErrorNone) return false;
+
+    bool rx_success = false;
+    uint32_t start_time = furi_get_tick();
     
-    if(furi_hal_nfc_poller_tx(tx, tx_bits) != FuriHalNfcErrorNone) {
-        FURI_LOG_E(TAG, "TX FAILED");
-        return false;
+    // Loop sicuro di attesa attiva (Max 150ms)
+    while(furi_get_tick() - start_time < 150) {
+        FuriHalNfcEvent event = furi_hal_nfc_poller_wait_event(20);
+        
+        if(event & FuriHalNfcEventRxEnd) {
+            rx_success = true;
+            break;
+        }
+        if(event & FuriHalNfcEventTimeout) {
+            break; // Timeout reale, usciamo
+        }
+        // Se riceve 0x20 (TxEnd) o 0 (Nessun evento in questi 20ms), il loop continua!
     }
 
-    FuriHalNfcEvent event = furi_hal_nfc_poller_wait_event(100);
-    
-    if(event & FuriHalNfcEventRxEnd) {
-        if(furi_hal_nfc_poller_rx(rx, rx_max, rx_bits) == FuriHalNfcErrorNone) {
-            return (*rx_bits > 0);
-        }
-    } else {
-        FURI_LOG_W(TAG, "TX %zu bits ERR/TMO: 0x%08lx", tx_bits, (uint32_t)event);
-    }
-    return false;
+    if(!rx_success) return false;
+
+    if(furi_hal_nfc_poller_rx(rx, rx_max, rx_bits) != FuriHalNfcErrorNone) return false;
+    return (*rx_bits > 0);
 }
 
 static void nfc_send_halt_only(void) {
@@ -51,16 +59,17 @@ static void nfc_send_halt_only(void) {
     append_crc(halt, 2);
     furi_thread_flags_clear(0xFFFFFFFF);
     furi_hal_nfc_poller_tx(halt, 32);
-    furi_hal_nfc_poller_wait_event(10); 
+    furi_hal_nfc_poller_wait_event(20); // Aspetta solo che la trasmissione finisca
 }
 
-// FIX CRITICO: Forza il chip ST25 a spegnersi e riaccendersi (Ciclo Hardware profondo)
+// FIX CRITICO: Ripristinato field_on() per non lasciare il tag senza corrente
 static void force_hardware_reset(void) {
     furi_hal_nfc_low_power_mode_start(); 
-    furi_delay_ms(20);
+    furi_delay_ms(15);
     furi_hal_nfc_low_power_mode_stop();  
     furi_hal_nfc_set_mode(FuriHalNfcModePoller, FuriHalNfcTechIso14443a);
-    furi_delay_ms(20); 
+    furi_hal_nfc_poller_field_on(); 
+    furi_delay_ms(40); // Tempo obbligatorio per ricaricare il tag RF
 }
 
 static bool nfc_iso14443a_wake_and_select(void) {
@@ -90,23 +99,28 @@ static bool try_gen1_backdoor(void) {
     uint8_t rx[32];
     size_t  rx_bits = 0;
 
-    FURI_LOG_I(TAG, "TRY BACKDOOR GEN1");
     uint8_t c1 = 0x40;
     
     furi_thread_flags_clear(0xFFFFFFFF);
-    if(furi_hal_nfc_poller_tx(&c1, 7) != FuriHalNfcErrorNone) {
-        FURI_LOG_E(TAG, "GEN1 TX FAIL - RADIO OFF");
-        return false;
-    }
+    if(furi_hal_nfc_poller_tx(&c1, 7) != FuriHalNfcErrorNone) return false;
 
-    FuriHalNfcEvent event = furi_hal_nfc_poller_wait_event(100);
-    if(event & FuriHalNfcEventRxEnd) {
-        if(furi_hal_nfc_poller_rx(rx, sizeof(rx), &rx_bits) != FuriHalNfcErrorNone) return false;
-        if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
-    } else {
-        FURI_LOG_W(TAG, "40 EVENT FAIL: 0x%08lx", (uint32_t)event);
-        return false;
+    bool rx_success = false;
+    uint32_t start_time = furi_get_tick();
+    
+    // Loop sicuro applicato anche alla backdoor
+    while(furi_get_tick() - start_time < 150) {
+        FuriHalNfcEvent event = furi_hal_nfc_poller_wait_event(20);
+        if(event & FuriHalNfcEventRxEnd) {
+            rx_success = true;
+            break;
+        }
+        if(event & FuriHalNfcEventTimeout) break;
     }
+    
+    if(!rx_success) return false;
+    
+    if(furi_hal_nfc_poller_rx(rx, sizeof(rx), &rx_bits) != FuriHalNfcErrorNone) return false;
+    if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
 
     uint8_t c2 = 0x43;
     if(!nfc_send_recv(&c2, 8, rx, sizeof(rx), &rx_bits)) return false;
@@ -119,7 +133,6 @@ static bool try_gen2_backdoor(void) {
     uint8_t rx[32];
     size_t rx_bits = 0;
 
-    FURI_LOG_I(TAG, "TRY BACKDOOR GEN2");
     if(!nfc_iso14443a_wake_and_select()) return false;
 
     uint8_t auth_cmd[] = {0x60, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00};
@@ -237,7 +250,7 @@ static bool seal_ufuid(void) {
 }
 
 // =========================================================
-// ESECUZIONE NFC PRINCIPALE (FIX RADIO START)
+// ESECUZIONE NFC PRINCIPALE
 // =========================================================
 
 static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
@@ -246,11 +259,11 @@ static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
     NotificationApp* notifications = furi_record_open(RECORD_NOTIFICATION);
     notification_message(notifications, &sequence_blink_start_cyan);
 
-    // FIX: Sequenza infallibile per accendere il chip RF in dev
     furi_hal_nfc_acquire();
     furi_hal_nfc_low_power_mode_stop();
     furi_hal_nfc_set_mode(FuriHalNfcModePoller, FuriHalNfcTechIso14443a);
-    furi_delay_ms(50); // Attendiamo che l'hardware si stabilizzi
+    furi_hal_nfc_poller_field_on();
+    furi_delay_ms(40); 
 
     uint32_t start_time = furi_get_tick();
 
@@ -263,9 +276,7 @@ static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
             }
             break; 
         }
-        
-        // Pausa di rispetto radio
-        furi_delay_ms(50); 
+        furi_delay_ms(50);
     }
 
     furi_hal_nfc_low_power_mode_start();
@@ -301,7 +312,7 @@ static void draw_callback(Canvas* canvas, void* ctx) {
     canvas_set_font(canvas, FontPrimary);
 
     if(context->state == AppMenu) {
-        canvas_draw_str_aligned(canvas, 64, 5, AlignCenter, AlignTop, "UFUID Sealer v2.9");
+        canvas_draw_str_aligned(canvas, 64, 5, AlignCenter, AlignTop, "UFUID Sealer v3.0");
         canvas_set_font(canvas, FontSecondary);
         for(uint8_t i = 0; i < 3; i++) {
             if(i == context->menu_index) {
@@ -325,7 +336,7 @@ static void draw_callback(Canvas* canvas, void* ctx) {
     } else if(context->state == AppError) {
         canvas_draw_str_aligned(canvas, 64, 20, AlignCenter, AlignCenter, "ERRORE");
         canvas_set_font(canvas, FontSecondary);
-        canvas_draw_str_aligned(canvas, 64, 35, AlignCenter, AlignCenter, "Radio Error / Tag non letto");
+        canvas_draw_str_aligned(canvas, 64, 35, AlignCenter, AlignCenter, "Tag non letto o fallito");
         canvas_draw_str_aligned(canvas, 64, 45, AlignCenter, AlignCenter, "Riprova e tieni fermo.");
         canvas_draw_str_aligned(canvas, 64, 55, AlignCenter, AlignCenter, "Premi BACK");
     }
