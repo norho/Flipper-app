@@ -26,6 +26,7 @@ static void append_crc(uint8_t* data, size_t len) {
     data[len + 1] = (crc >> 8) & 0xFF;
 }
 
+// FIX: Accettiamo frame incompleti e violazioni di parità (tipiche degli ACK a 4 bit)
 static bool nfc_send_recv(uint8_t* tx, size_t tx_bits, uint8_t* rx, size_t rx_max, size_t* rx_bits) {
     furi_thread_flags_clear(0xFFFFFFFF);
     if(furi_hal_nfc_poller_tx(tx, tx_bits) != FuriHalNfcErrorNone) return false;
@@ -46,7 +47,10 @@ static bool nfc_send_recv(uint8_t* tx, size_t tx_bits, uint8_t* rx, size_t rx_ma
     }
 
     if(!rx_success) return false;
-    if(furi_hal_nfc_poller_rx(rx, rx_max, rx_bits) != FuriHalNfcErrorNone) return false;
+    
+    // Leggiamo i bit. Ignoriamo il codice di errore (IncompleteFrame/Parity)
+    // Finché rx_bits > 0, abbiamo catturato qualcosa di utile.
+    furi_hal_nfc_poller_rx(rx, rx_max, rx_bits);
     return (*rx_bits > 0);
 }
 
@@ -92,15 +96,9 @@ static bool nfc_iso14443a_wake_and_select(void) {
 static bool gen1_magic_knock(void) {
     uint8_t rx[32];
     size_t  rx_bits = 0;
-    
-    // Comando 0x40. Disattiviamo tutto il padding hardware.
     uint8_t c1 = 0x40;
     
     furi_thread_flags_clear(0xFFFFFFFF);
-    
-    // Forziamo il Flipper a mandare bit crudi senza parità o CRC
-    // usando la API FuriHalNfcPollerTxRxOptions se disponibile, 
-    // altrimenti speriamo che l'HAL gestisca correttamente i 7 bit senza corrompere l'ultimo bit.
     if(furi_hal_nfc_poller_tx(&c1, 7) != FuriHalNfcErrorNone) return false;
 
     bool rx_success = false;
@@ -108,13 +106,10 @@ static bool gen1_magic_knock(void) {
     
     while(furi_get_tick() - start_time < 200) {
         FuriHalNfcEvent event = furi_hal_nfc_poller_wait_event(20);
-        
         if(event & FuriHalNfcEventRxEnd) {
             rx_success = true;
             break;
         }
-        
-        // Timeout prolungato per i cloni lenti
         if((event & FuriHalNfcEventTimeout) && (furi_get_tick() - start_time > 150)) {
             break;
         }
@@ -122,10 +117,11 @@ static bool gen1_magic_knock(void) {
     
     if(!rx_success) return false;
     
-    if(furi_hal_nfc_poller_rx(rx, sizeof(rx), &rx_bits) != FuriHalNfcErrorNone) return false;
+    // FIX: Preleviamo i dati grezzi bypassando l'approvazione formale dell'HAL
+    furi_hal_nfc_poller_rx(rx, sizeof(rx), &rx_bits);
+    
     if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
 
-    // Conferma sblocco
     uint8_t c2 = 0x43;
     if(!nfc_send_recv(&c2, 8, rx, sizeof(rx), &rx_bits)) return false;
     if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
@@ -134,12 +130,10 @@ static bool gen1_magic_knock(void) {
 }
 
 static bool try_gen1_backdoor(void) {
-    FURI_LOG_I(TAG, "TRY GEN1 COLD");
     return gen1_magic_knock();
 }
 
 static bool try_gen1_wake_backdoor(void) {
-    FURI_LOG_I(TAG, "TRY GEN1 WAKE");
     uint8_t rx[32];
     size_t rx_bits = 0;
     uint8_t wupa = 0x52;
@@ -153,7 +147,6 @@ static bool try_gen1_wake_backdoor(void) {
 }
 
 static bool try_gen1_proxmark_backdoor(void) {
-    FURI_LOG_I(TAG, "TRY GEN1 PROXMARK");
     if(!nfc_iso14443a_wake_and_select()) return false;
     nfc_send_halt_only();
     furi_delay_ms(30); 
@@ -164,7 +157,6 @@ static bool try_gen2_backdoor(void) {
     uint8_t rx[32];
     size_t rx_bits = 0;
 
-    FURI_LOG_I(TAG, "TRY GEN2 (UFUID)");
     if(!nfc_iso14443a_wake_and_select()) return false;
 
     uint8_t auth_cmd[] = {0x60, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00};
@@ -191,7 +183,7 @@ static bool prepare_fuid_tag(void) {
     if(try_gen1_backdoor()) return true;
     force_hardware_reset(40);
     if(try_gen1_wake_backdoor()) return true;
-    force_hardware_reset(80); // Ricarica condensatori maggiorata
+    force_hardware_reset(80); 
     if(try_gen1_proxmark_backdoor()) return true;
     return false;
 }
@@ -215,7 +207,7 @@ static bool nfc_write_block(uint8_t block_num, uint8_t* data) {
     uint8_t cmd[4] = {0xA0, block_num, 0, 0};
     append_crc(cmd, 2);
     if(!nfc_send_recv(cmd, 32, rx, sizeof(rx), &rx_bits)) {
-        FURI_LOG_E(TAG, "Write B%d 0xA0 Timeout", block_num);
+        FURI_LOG_E(TAG, "Write B%d 0xA0 TMO/ERR", block_num);
         return false;
     }
     if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) {
@@ -227,7 +219,7 @@ static bool nfc_write_block(uint8_t block_num, uint8_t* data) {
     memcpy(write_data, data, 16);
     append_crc(write_data, 16);
     if(!nfc_send_recv(write_data, 144, rx, sizeof(rx), &rx_bits)) {
-        FURI_LOG_E(TAG, "Write B%d DATA Timeout", block_num);
+        FURI_LOG_E(TAG, "Write B%d DATA TMO/ERR", block_num);
         return false;
     }
     if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) {
@@ -370,7 +362,7 @@ static void draw_callback(Canvas* canvas, void* ctx) {
     canvas_set_font(canvas, FontPrimary);
 
     if(context->state == AppMenu) {
-        canvas_draw_str_aligned(canvas, 64, 5, AlignCenter, AlignTop, "UFUID Sealer v12.0");
+        canvas_draw_str_aligned(canvas, 64, 5, AlignCenter, AlignTop, "UFUID Sealer v13.0");
         canvas_set_font(canvas, FontSecondary);
         for(uint8_t i = 0; i < 3; i++) {
             if(i == context->menu_index) {
