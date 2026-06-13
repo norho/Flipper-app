@@ -9,10 +9,9 @@
 #include <string.h>
 
 #define TAG "UFUID_Sealer"
-#define NFC_EVENT_TIMEOUT_MS 200
 
 // =========================================================
-// HELPER NFC E CALCOLI
+// HELPER
 // =========================================================
 
 static void append_crc(uint8_t* data, size_t len) {
@@ -29,74 +28,38 @@ static void append_crc(uint8_t* data, size_t len) {
 
 static bool nfc_send_recv(
     uint8_t* tx,
-    size_t tx_bits,
+    size_t   tx_bits,
     uint8_t* rx,
-    size_t rx_max,
-    size_t* rx_bits) {
+    size_t   rx_max,
+    size_t*  rx_bits) {
 
     if(furi_hal_nfc_poller_tx(tx, tx_bits) != FuriHalNfcErrorNone) return false;
 
     FuriHalNfcEvent event = 0;
-    uint32_t timeout_ms = NFC_EVENT_TIMEOUT_MS;
-
+    uint32_t timeout_ms = 200;
     while(timeout_ms > 0) {
         event = furi_hal_nfc_poller_wait_event(10);
         timeout_ms -= 10;
-        if(event & FuriHalNfcEventRxEnd)    break;
-        if(event & FuriHalNfcEventTimeout)  return false;
+        if(event & FuriHalNfcEventRxEnd)     break;
+        if(event & FuriHalNfcEventTimeout)   return false;
         if(event & FuriHalNfcEventCollision) return false;
     }
-
     if(timeout_ms == 0) return false;
 
     if(furi_hal_nfc_poller_rx(rx, rx_max, rx_bits) != FuriHalNfcErrorNone) return false;
-
     return (*rx_bits > 0);
 }
 
-static bool nfc_iso14443a_wake_and_select(void) {
-    uint8_t rx[32];
-    size_t  rx_bits = 0;
-
-    FuriHalNfcError err = furi_hal_nfc_iso14443a_poller_trx_short_frame(
-        FuriHalNfcaShortFrameAllReq);
-    if(err != FuriHalNfcErrorNone) return false;
-
-    FuriHalNfcEvent event = 0;
-    uint32_t timeout_ms = 100;
-    while(timeout_ms > 0) {
-        event = furi_hal_nfc_poller_wait_event(10);
-        timeout_ms -= 10;
-        if(event & FuriHalNfcEventRxEnd)   break;
-        if(event & FuriHalNfcEventTimeout) return false;
-    }
-    if(timeout_ms == 0) return false;
-
-    if(furi_hal_nfc_poller_rx(rx, sizeof(rx), &rx_bits) != FuriHalNfcErrorNone) return false;
-    if(rx_bits < 16) return false;
-
-    uint8_t anticoll[2] = {0x93, 0x20};
-    if(!nfc_send_recv(anticoll, 16, rx, sizeof(rx), &rx_bits)) return false;
-    if(rx_bits < 40) return false;
-
-    uint8_t select_cmd[9];
-    select_cmd[0] = 0x93;
-    select_cmd[1] = 0x70;
-    memcpy(&select_cmd[2], rx, 5);
-    append_crc(select_cmd, 7);
-    if(!nfc_send_recv(select_cmd, 72, rx, sizeof(rx), &rx_bits)) return false;
-
-    return (rx_bits >= 8);
-}
-
 // =========================================================
-// MOTORE DI SCRITTURA E LOGICA TAG
+// BACKDOOR GEN1 — tenta direttamente senza wake/select
+// Alcuni tag Gen1 rispondono a 0x40(7bit) senza WUPA prima
 // =========================================================
 
-static bool unlock_gen1_backdoor(void) {
+static bool try_gen1_backdoor(void) {
     uint8_t rx[4];
     size_t  rx_bits = 0;
 
+    // 0x40 a 7 bit — backdoor knock
     uint8_t c1 = 0x40;
     if(furi_hal_nfc_poller_tx(&c1, 7) != FuriHalNfcErrorNone) return false;
 
@@ -105,20 +68,24 @@ static bool unlock_gen1_backdoor(void) {
     while(timeout_ms > 0) {
         event = furi_hal_nfc_poller_wait_event(10);
         timeout_ms -= 10;
-        if(event & FuriHalNfcEventRxEnd)   break;
-        if(event & FuriHalNfcEventTimeout) return false;
+        if(event & FuriHalNfcEventRxEnd) break;
     }
     if(timeout_ms == 0) return false;
 
     if(furi_hal_nfc_poller_rx(rx, sizeof(rx), &rx_bits) != FuriHalNfcErrorNone) return false;
     if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
 
+    // 0x43 a 8 bit — confirm backdoor
     uint8_t c2 = 0x43;
     if(!nfc_send_recv(&c2, 8, rx, sizeof(rx), &rx_bits)) return false;
     if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
 
     return true;
 }
+
+// =========================================================
+// SCRITTURA
+// =========================================================
 
 static bool nfc_write_block(uint8_t block_num, uint8_t* data) {
     uint8_t rx[4];
@@ -138,8 +105,8 @@ static bool nfc_write_block(uint8_t block_num, uint8_t* data) {
 }
 
 static bool core_write_mifare_bin(const char* file_path) {
-    Storage* storage = furi_record_open(RECORD_STORAGE);
-    File*    file    = storage_file_alloc(storage);
+    Storage* storage    = furi_record_open(RECORD_STORAGE);
+    File*    file       = storage_file_alloc(storage);
     uint8_t  dump[1024];
     size_t   bytes_read = 0;
 
@@ -181,7 +148,7 @@ static bool seal_ufuid(void) {
 }
 
 // =========================================================
-// ESECUZIONE NFC CON LED E CICLO DI RICERCA
+// ESECUZIONE NFC
 // =========================================================
 
 static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
@@ -200,16 +167,17 @@ static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
     uint32_t start_time = furi_get_tick();
 
     while(furi_get_tick() - start_time < 5000) {
-        if(nfc_iso14443a_wake_and_select()) {
-            if(unlock_gen1_backdoor()) {
-                if(action_index == 0 || action_index == 1) {
-                    result = core_write_mifare_bin(file_path);
-                } else if(action_index == 2) {
-                    result = seal_ufuid();
-                }
-                break;
+
+        // Tenta backdoor diretta — senza wake/select preventivo
+        if(try_gen1_backdoor()) {
+            if(action_index == 0 || action_index == 1) {
+                result = core_write_mifare_bin(file_path);
+            } else if(action_index == 2) {
+                result = seal_ufuid();
             }
+            break;
         }
+
         furi_delay_ms(100);
     }
 
@@ -246,7 +214,7 @@ static void draw_callback(Canvas* canvas, void* ctx) {
     canvas_set_font(canvas, FontPrimary);
 
     if(context->state == AppMenu) {
-        canvas_draw_str_aligned(canvas, 64, 5, AlignCenter, AlignTop, "UFUID Sealer v1.4");
+        canvas_draw_str_aligned(canvas, 64, 5, AlignCenter, AlignTop, "UFUID Sealer v1.5");
         canvas_set_font(canvas, FontSecondary);
         for(uint8_t i = 0; i < 3; i++) {
             if(i == context->menu_index) {
