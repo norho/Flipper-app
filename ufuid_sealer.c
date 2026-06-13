@@ -64,7 +64,9 @@ static void force_hardware_reset(void) {
     furi_hal_nfc_low_power_mode_stop();  
     furi_hal_nfc_set_mode(FuriHalNfcModePoller, FuriHalNfcTechIso14443a);
     furi_hal_nfc_poller_field_on(); 
-    furi_delay_ms(40); 
+    
+    // FIX: Raddoppiato il tempo di carica condensatori RF per i FUID ostinati
+    furi_delay_ms(80); 
 }
 
 static bool nfc_iso14443a_wake_and_select(void) {
@@ -124,6 +126,30 @@ static bool try_gen1_wake_backdoor(void) {
     return true;
 }
 
+// FIX: Sequenza stile Proxmark3 per cloni che richiedono l'Halt logico per entrare in backdoor
+static bool try_gen1_proxmark_backdoor(void) {
+    uint8_t rx[32];
+    size_t  rx_bits = 0;
+
+    FURI_LOG_I(TAG, "TRY BACKDOOR GEN1 PROXMARK");
+    if(!nfc_iso14443a_wake_and_select()) return false;
+    
+    nfc_send_halt_only();
+    
+    // Attendiamo 20ms ma NON spegniamo il campo (il chip resta alimentato ma in stato Halt)
+    furi_delay_ms(20); 
+
+    uint8_t c1 = 0x40;
+    if(!nfc_send_recv(&c1, 7, rx, sizeof(rx), &rx_bits)) return false;
+    if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
+
+    uint8_t c2 = 0x43;
+    if(!nfc_send_recv(&c2, 8, rx, sizeof(rx), &rx_bits)) return false;
+    if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
+
+    return true;
+}
+
 static bool try_gen2_backdoor(void) {
     uint8_t rx[32];
     size_t rx_bits = 0;
@@ -152,34 +178,26 @@ static bool try_gen2_backdoor(void) {
 // =========================================================
 
 static bool prepare_fuid_tag(void) {
-    // Pipeline aggressiva per cloni Gen1 (FUID)
     if(try_gen1_backdoor()) return true;
 
     force_hardware_reset();
     if(try_gen1_wake_backdoor()) return true;
 
     force_hardware_reset();
-    if(nfc_iso14443a_wake_and_select()) {
-        nfc_send_halt_only();
-        force_hardware_reset();
-        if(try_gen1_backdoor()) return true;
-    }
+    if(try_gen1_proxmark_backdoor()) return true;
+
     return false;
 }
 
 static bool prepare_ufuid_tag(void) {
-    // Pipeline intoccabile certificata AMS Bambu per Gen2 (UFUID)
     if(try_gen1_backdoor()) return true;
 
     force_hardware_reset();
     if(try_gen2_backdoor()) return true;
 
     force_hardware_reset();
-    if(nfc_iso14443a_wake_and_select()) {
-        nfc_send_halt_only();
-        force_hardware_reset();
-        if(try_gen1_backdoor()) return true;
-    }
+    if(try_gen1_proxmark_backdoor()) return true;
+    
     return false;
 }
 // =========================================================
@@ -291,14 +309,15 @@ static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
     furi_hal_nfc_low_power_mode_stop();
     furi_hal_nfc_set_mode(FuriHalNfcModePoller, FuriHalNfcTechIso14443a);
     furi_hal_nfc_poller_field_on();
-    furi_delay_ms(40);
+    
+    // FIX: Ricarica profonda all'avvio del ciclo
+    furi_delay_ms(80);
 
     uint32_t start_time = furi_get_tick();
 
     while(furi_get_tick() - start_time < 5000) {
         bool tag_ready = false;
         
-        // Routing isolato basato sulla selezione dell'utente
         if (action_index == 0) {
             tag_ready = prepare_fuid_tag();
         } else {
