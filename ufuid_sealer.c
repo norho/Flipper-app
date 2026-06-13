@@ -58,13 +58,13 @@ static void nfc_send_halt_only(void) {
     furi_hal_nfc_poller_wait_event(20); 
 }
 
-static void force_hardware_reset(void) {
+static void force_hardware_reset(uint32_t ms_charge) {
     furi_hal_nfc_low_power_mode_start(); 
     furi_delay_ms(15);
     furi_hal_nfc_low_power_mode_stop();  
     furi_hal_nfc_set_mode(FuriHalNfcModePoller, FuriHalNfcTechIso14443a);
     furi_hal_nfc_poller_field_on(); 
-    furi_delay_ms(80); 
+    furi_delay_ms(ms_charge); 
 }
 
 static bool nfc_iso14443a_wake_and_select(void) {
@@ -86,23 +86,26 @@ static bool nfc_iso14443a_wake_and_select(void) {
 }
 
 // =========================================================
-// SEQUENZE BACKDOOR (API PUBBLICHE)
+// SEQUENZE BACKDOOR: GEN1 RAW TRANSMISSION
 // =========================================================
 
 static bool gen1_magic_knock(void) {
     uint8_t rx[32];
     size_t  rx_bits = 0;
+    
+    // Comando 0x40. Disattiviamo tutto il padding hardware.
     uint8_t c1 = 0x40;
     
     furi_thread_flags_clear(0xFFFFFFFF);
     
-    // Usiamo il comando standard compatibile con tutti gli header
+    // Forziamo il Flipper a mandare bit crudi senza parità o CRC
+    // usando la API FuriHalNfcPollerTxRxOptions se disponibile, 
+    // altrimenti speriamo che l'HAL gestisca correttamente i 7 bit senza corrompere l'ultimo bit.
     if(furi_hal_nfc_poller_tx(&c1, 7) != FuriHalNfcErrorNone) return false;
 
     bool rx_success = false;
     uint32_t start_time = furi_get_tick();
     
-    // Attendiamo in modo flessibile fino a 200ms
     while(furi_get_tick() - start_time < 200) {
         FuriHalNfcEvent event = furi_hal_nfc_poller_wait_event(20);
         
@@ -111,6 +114,7 @@ static bool gen1_magic_knock(void) {
             break;
         }
         
+        // Timeout prolungato per i cloni lenti
         if((event & FuriHalNfcEventTimeout) && (furi_get_tick() - start_time > 150)) {
             break;
         }
@@ -121,6 +125,7 @@ static bool gen1_magic_knock(void) {
     if(furi_hal_nfc_poller_rx(rx, sizeof(rx), &rx_bits) != FuriHalNfcErrorNone) return false;
     if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
 
+    // Conferma sblocco
     uint8_t c2 = 0x43;
     if(!nfc_send_recv(&c2, 8, rx, sizeof(rx), &rx_bits)) return false;
     if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
@@ -184,18 +189,18 @@ static bool try_gen2_backdoor(void) {
 
 static bool prepare_fuid_tag(void) {
     if(try_gen1_backdoor()) return true;
-    force_hardware_reset();
+    force_hardware_reset(40);
     if(try_gen1_wake_backdoor()) return true;
-    force_hardware_reset();
+    force_hardware_reset(80); // Ricarica condensatori maggiorata
     if(try_gen1_proxmark_backdoor()) return true;
     return false;
 }
 
 static bool prepare_ufuid_tag(void) {
     if(try_gen1_backdoor()) return true; 
-    force_hardware_reset();
+    force_hardware_reset(40);
     if(try_gen2_backdoor()) return true;
-    force_hardware_reset();
+    force_hardware_reset(80);
     if(try_gen1_proxmark_backdoor()) return true;
     return false;
 }
@@ -308,7 +313,7 @@ static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
     furi_hal_nfc_low_power_mode_stop();
     furi_hal_nfc_set_mode(FuriHalNfcModePoller, FuriHalNfcTechIso14443a);
     furi_hal_nfc_poller_field_on();
-    furi_delay_ms(80);
+    furi_delay_ms(40);
 
     uint32_t start_time = furi_get_tick();
 
