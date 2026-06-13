@@ -11,23 +11,6 @@
 #define TAG "UFUID_Sealer"
 
 // =========================================================
-// STRUTTURE DATI GLOBALI (Thread Shared)
-// =========================================================
-
-typedef enum { AppMenu, AppProcessing, AppSuccess, AppError } AppState;
-
-typedef struct {
-    AppState          state;
-    uint8_t           menu_index;
-    const char* menu_items[3];
-    FuriMessageQueue* event_queue;
-    char              file_path[256];
-    bool              worker_running;
-    bool              worker_success;
-    FuriThread* worker_thread;
-} AppContext;
-
-// =========================================================
 // HELPER E PROTOCOLLI RADIO ISO14443A
 // =========================================================
 
@@ -43,7 +26,6 @@ static void append_crc(uint8_t* data, size_t len) {
     data[len + 1] = (crc >> 8) & 0xFF;
 }
 
-// FIX: Parsing flessibile che ignora TxEnd (0x20) e aspetta RxEnd
 static bool nfc_send_recv(uint8_t* tx, size_t tx_bits, uint8_t* rx, size_t rx_max, size_t* rx_bits) {
     furi_thread_flags_clear(0xFFFFFFFF);
     if(furi_hal_nfc_poller_tx(tx, tx_bits) != FuriHalNfcErrorNone) return false;
@@ -59,6 +41,7 @@ static bool nfc_send_recv(uint8_t* tx, size_t tx_bits, uint8_t* rx, size_t rx_ma
             break;
         }
         
+        // Timeout puro
         if((event & FuriHalNfcEventTimeout) && !(event & FuriHalNfcEventRxEnd)) {
             break; 
         }
@@ -116,24 +99,7 @@ static bool try_gen1_backdoor(void) {
     FURI_LOG_I(TAG, "TRY BACKDOOR GEN1");
     uint8_t c1 = 0x40;
     
-    furi_thread_flags_clear(0xFFFFFFFF);
-    if(furi_hal_nfc_poller_tx(&c1, 7) != FuriHalNfcErrorNone) return false;
-
-    bool rx_success = false;
-    uint32_t start_time = furi_get_tick();
-    
-    while(furi_get_tick() - start_time < 150) {
-        FuriHalNfcEvent event = furi_hal_nfc_poller_wait_event(20);
-        if(event & FuriHalNfcEventRxEnd) {
-            rx_success = true;
-            break;
-        }
-        if((event & FuriHalNfcEventTimeout) && !(event & FuriHalNfcEventRxEnd)) break;
-    }
-    
-    if(!rx_success) return false;
-    
-    if(furi_hal_nfc_poller_rx(rx, sizeof(rx), &rx_bits) != FuriHalNfcErrorNone) return false;
+    if(!nfc_send_recv(&c1, 7, rx, sizeof(rx), &rx_bits)) return false;
     if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
 
     uint8_t c2 = 0x43;
@@ -182,7 +148,7 @@ static bool prepare_magic_tag(void) {
     return false;
 }
 // =========================================================
-// MOTORE DI SCRITTURA E SIGILLATURA
+// MOTORE DI SCRITTURA E SIGILLATURA CON LOG CAPILLARI
 // =========================================================
 
 static bool nfc_write_block(uint8_t block_num, uint8_t* data) {
@@ -191,15 +157,28 @@ static bool nfc_write_block(uint8_t block_num, uint8_t* data) {
 
     uint8_t cmd[4] = {0xA0, block_num, 0, 0};
     append_crc(cmd, 2);
-    if(!nfc_send_recv(cmd, 32, rx, sizeof(rx), &rx_bits)) return false;
-    if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
+    if(!nfc_send_recv(cmd, 32, rx, sizeof(rx), &rx_bits)) {
+        FURI_LOG_E(TAG, "Write B%d 0xA0 Timeout", block_num);
+        return false;
+    }
+    if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) {
+        FURI_LOG_E(TAG, "Write B%d 0xA0 NAK", block_num);
+        return false;
+    }
 
     uint8_t write_data[18];
     memcpy(write_data, data, 16);
     append_crc(write_data, 16);
-    if(!nfc_send_recv(write_data, 144, rx, sizeof(rx), &rx_bits)) return false;
+    if(!nfc_send_recv(write_data, 144, rx, sizeof(rx), &rx_bits)) {
+        FURI_LOG_E(TAG, "Write B%d DATA Timeout", block_num);
+        return false;
+    }
 
-    return (rx_bits >= 4 && (rx[0] & 0x0F) == 0x0A);
+    if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) {
+        FURI_LOG_E(TAG, "Write B%d DATA NAK", block_num);
+        return false;
+    }
+    return true;
 }
 
 static bool core_write_mifare_bin(const char* file_path) {
@@ -232,7 +211,7 @@ static bool core_write_mifare_bin(const char* file_path) {
             success = false;
             break;
         }
-        furi_delay_ms(5);
+        furi_delay_ms(5); 
     }
     
     if(success) {
@@ -265,14 +244,11 @@ static bool seal_ufuid(void) {
 }
 
 // =========================================================
-// THREAD WORKER NFC INDIPENDENTE (ANTI-LOCKUP)
+// ESECUZIONE NFC PRINCIPALE (SINGLE THREAD SICURO)
 // =========================================================
 
-static int32_t nfc_worker_thread(void* thread_context) {
-    AppContext* context = thread_context;
+static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
     bool result = false;
-
-    FURI_LOG_I(TAG, "Worker Thread Partito");
 
     NotificationApp* notifications = furi_record_open(RECORD_NOTIFICATION);
     notification_message(notifications, &sequence_blink_start_cyan);
@@ -281,19 +257,21 @@ static int32_t nfc_worker_thread(void* thread_context) {
     furi_hal_nfc_low_power_mode_stop();
     furi_hal_nfc_set_mode(FuriHalNfcModePoller, FuriHalNfcTechIso14443a);
     furi_hal_nfc_poller_field_on();
+    
+    furi_delay_ms(40);
 
     uint32_t start_time = furi_get_tick();
 
-    while((furi_get_tick() - start_time < 5000) && context->worker_running) {
+    while(furi_get_tick() - start_time < 5000) {
         if(prepare_magic_tag()) {
-            if(context->menu_index == 0 || context->menu_index == 1) {
-                result = core_write_mifare_bin(context->file_path);
-            } else if(context->menu_index == 2) {
+            if(action_index == 0 || action_index == 1) {
+                result = core_write_mifare_bin(file_path);
+            } else if(action_index == 2) {
                 result = seal_ufuid();
             }
             break; 
         }
-        furi_delay_ms(100);
+        furi_delay_ms(50);
     }
 
     furi_hal_nfc_low_power_mode_start();
@@ -307,21 +285,21 @@ static int32_t nfc_worker_thread(void* thread_context) {
     }
     furi_record_close(RECORD_NOTIFICATION);
 
-    // Comunica alla GUI che il lavoro è finito
-    context->worker_success = result;
-    context->worker_running = false;
-    
-    InputEvent result_event;
-    result_event.type = InputTypeShort;
-    result_event.key = InputKeyMAX; 
-    furi_message_queue_put(context->event_queue, &result_event, FuriWaitForever);
-
-    return 0;
+    return result;
 }
 
 // =========================================================
 // GUI E ENTRY POINT
 // =========================================================
+
+typedef enum { AppMenu, AppProcessing, AppSuccess, AppError } AppState;
+
+typedef struct {
+    AppState          state;
+    uint8_t           menu_index;
+    const char* menu_items[3];
+    FuriMessageQueue* event_queue;
+} AppContext;
 
 static void draw_callback(Canvas* canvas, void* ctx) {
     AppContext* context = ctx;
@@ -329,7 +307,7 @@ static void draw_callback(Canvas* canvas, void* ctx) {
     canvas_set_font(canvas, FontPrimary);
 
     if(context->state == AppMenu) {
-        canvas_draw_str_aligned(canvas, 64, 5, AlignCenter, AlignTop, "UFUID Sealer v6.0");
+        canvas_draw_str_aligned(canvas, 64, 5, AlignCenter, AlignTop, "UFUID Sealer v7.0");
         canvas_set_font(canvas, FontSecondary);
         for(uint8_t i = 0; i < 3; i++) {
             if(i == context->menu_index) {
@@ -354,7 +332,7 @@ static void draw_callback(Canvas* canvas, void* ctx) {
         canvas_draw_str_aligned(canvas, 64, 20, AlignCenter, AlignCenter, "ERRORE");
         canvas_set_font(canvas, FontSecondary);
         canvas_draw_str_aligned(canvas, 64, 35, AlignCenter, AlignCenter, "Tag non letto o fallito");
-        canvas_draw_str_aligned(canvas, 64, 45, AlignCenter, AlignCenter, "Riprova e tieni fermo.");
+        canvas_draw_str_aligned(canvas, 64, 45, AlignCenter, AlignCenter, "Leggi log su qFlipper");
         canvas_draw_str_aligned(canvas, 64, 55, AlignCenter, AlignCenter, "Premi BACK");
     }
 }
@@ -367,15 +345,13 @@ static void input_callback(InputEvent* input_event, void* ctx) {
 int32_t ufuid_sealer_app(void* p) {
     UNUSED(p);
 
-    AppContext* context = malloc(sizeof(AppContext));
-    context->state = AppMenu;
-    context->menu_index = 0;
+    AppContext* context    = malloc(sizeof(AppContext));
+    context->state         = AppMenu;
+    context->menu_index    = 0;
     context->menu_items[0] = "1. Scrivi tag FUID";
     context->menu_items[1] = "2. Scrivi tag UFUID";
     context->menu_items[2] = "3. Sigilla tag UFUID";
-    context->event_queue = furi_message_queue_alloc(8, sizeof(InputEvent));
-    context->worker_running = false;
-    context->worker_thread = furi_thread_alloc_ex("NFCWorker", 2048, nfc_worker_thread, context);
+    context->event_queue   = furi_message_queue_alloc(8, sizeof(InputEvent));
 
     ViewPort* view_port = view_port_alloc();
     view_port_draw_callback_set(view_port, draw_callback, context);
@@ -385,18 +361,10 @@ int32_t ufuid_sealer_app(void* p) {
     gui_add_view_port(gui, view_port, GuiLayerFullscreen);
 
     InputEvent event;
-    bool running = true;
+    bool       running = true;
 
     while(running) {
         if(furi_message_queue_get(context->event_queue, &event, 100) == FuriStatusOk) {
-            
-            // Gestione dei messaggi di ritorno dal Worker Thread
-            if(context->state == AppProcessing && !context->worker_running) {
-                context->state = context->worker_success ? AppSuccess : AppError;
-                view_port_update(view_port);
-                continue; 
-            }
-
             if(event.type == InputTypeShort) {
                 if(context->state == AppMenu) {
                     if(event.key == InputKeyBack) {
@@ -406,31 +374,29 @@ int32_t ufuid_sealer_app(void* p) {
                     } else if(event.key == InputKeyDown) {
                         if(context->menu_index < 2) context->menu_index++;
                     } else if(event.key == InputKeyOk) {
-                        bool go_ahead = true;
+                        bool        go_ahead  = true;
+                        FuriString* file_path = furi_string_alloc();
 
                         if(context->menu_index == 0 || context->menu_index == 1) {
-                            FuriString* file_path = furi_string_alloc();
                             furi_string_set(file_path, EXT_PATH("nfc"));
                             DialogsApp* dialogs = furi_record_open(RECORD_DIALOGS);
                             DialogsFileBrowserOptions browser_options;
                             dialog_file_browser_set_basic_options(&browser_options, ".bin", NULL);
                             browser_options.base_path = EXT_PATH("nfc");
                             go_ahead = dialog_file_browser_show(dialogs, file_path, file_path, &browser_options);
-                            
-                            if(go_ahead) {
-                                strncpy(context->file_path, furi_string_get_cstr(file_path), sizeof(context->file_path) - 1);
-                            }
-                            
                             furi_record_close(RECORD_DIALOGS);
-                            furi_string_free(file_path);
                         }
 
                         if(go_ahead) {
                             context->state = AppProcessing;
-                            context->worker_running = true;
-                            furi_thread_start(context->worker_thread);
+                            view_port_update(view_port);
+                            
+                            bool success = execute_nfc_action(context->menu_index, furi_string_get_cstr(file_path));
+                            
+                            context->state = success ? AppSuccess : AppError;
                             view_port_update(view_port);
                         }
+                        furi_string_free(file_path);
                     }
                 } else if(context->state == AppSuccess || context->state == AppError) {
                     if(event.key == InputKeyBack || event.key == InputKeyOk) {
@@ -439,22 +405,12 @@ int32_t ufuid_sealer_app(void* p) {
                     }
                 }
             } else if(event.type == InputTypeLong && event.key == InputKeyBack) {
-                if(context->state != AppProcessing) {
-                    running = false;
-                } else {
-                    context->worker_running = false; 
-                }
+                running = false;
             }
         }
         view_port_update(view_port);
     }
 
-    if(context->worker_running) {
-        context->worker_running = false;
-        furi_thread_join(context->worker_thread);
-    }
-
-    furi_thread_free(context->worker_thread);
     gui_remove_view_port(gui, view_port);
     view_port_free(view_port);
     furi_message_queue_free(context->event_queue);
