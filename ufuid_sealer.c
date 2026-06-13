@@ -4,6 +4,8 @@
 #include <gui/gui.h>
 #include <gui/elements.h>
 #include <dialogs/dialogs.h>
+#include <notification/notification.h>
+#include <notification/notification_messages.h>
 #include <string.h>
 
 #define TAG "UFUID_Sealer"
@@ -12,7 +14,7 @@
 // HELPER NFC E CALCOLI
 // =========================================================
 
-// Calcolo e accodamento del CRC-A standard
+// Calcolo del CRC-A standard ISO14443A
 static void append_crc(uint8_t* data, size_t len) {
     uint16_t crc = 0x6363; 
     for(size_t i = 0; i < len; i++) {
@@ -25,26 +27,24 @@ static void append_crc(uint8_t* data, size_t len) {
     data[len+1] = (crc >> 8) & 0xFF;
 }
 
-// Spedizione e ricezione raw sincronizzata con l'HAL del Flipper
+// Spedizione e ricezione raw sincronizzata
 static bool nfc_send_recv(uint8_t* tx, size_t tx_bits, uint8_t* rx, size_t rx_max, size_t* rx_bits) {
     furi_thread_flags_clear(0xFFFFFFFF);
     if(furi_hal_nfc_poller_tx(tx, tx_bits) != FuriHalNfcErrorNone) return false;
-    
-    // Attesa hardware nativa della risposta del tag
     if(furi_hal_nfc_poller_rx(rx, rx_max, rx_bits) != FuriHalNfcErrorNone) return false;
     return (*rx_bits > 0);
 }
 
-// Handshake ISO14443A per agganciare il tag ed entrare in stato ACTIVE
+// Protocollo obbligatorio di Risveglio e Selezione
 static bool nfc_iso14443a_wake_and_select(void) {
     uint8_t rx[32];
     size_t rx_bits = 0;
     
-    // 1. WUPA (Wake-Up All - 0x52 a 7 bit) - Risveglia i tag nel campo RF
+    // 1. WUPA (Wake-Up All 0x52, 7-bits)
     uint8_t wupa = 0x52;
     if(!nfc_send_recv(&wupa, 7, rx, sizeof(rx), &rx_bits)) return false;
     
-    // 2. Anti-collisione (0x93 0x20)
+    // 2. Anti-collisione Livello 1 (0x93 0x20)
     uint8_t anticoll[2] = {0x93, 0x20};
     if(!nfc_send_recv(anticoll, 16, rx, sizeof(rx), &rx_bits)) return false;
     if(rx_bits < 40) return false; 
@@ -57,7 +57,6 @@ static bool nfc_iso14443a_wake_and_select(void) {
     append_crc(select_cmd, 7);
     
     if(!nfc_send_recv(select_cmd, 72, rx, sizeof(rx), &rx_bits)) return false;
-    
     return true;
 }
 
@@ -80,10 +79,26 @@ static bool nfc_write_block(uint8_t block_num, uint8_t* data) {
 }
 
 // =========================================================
-// LOGICA DI COPIA E FILTRAGGIO CHIP
+// MOTORE DI SCRITTURA E LOGICA TAG
 // =========================================================
 
-static bool core_write_mifare_bin(const char* file_path, bool is_ufuid) {
+// Apre la porta sul retro per chip FUID e UFUID (Entrambi Gen1)
+static bool unlock_gen1_backdoor(void) {
+    uint8_t rx[4];
+    size_t rx_bits = 0;
+
+    uint8_t c1 = 0x40;
+    if(!nfc_send_recv(&c1, 7, rx, sizeof(rx), &rx_bits)) return false;
+    if((rx[0] & 0x0F) != 0x0A) return false;
+
+    uint8_t c2 = 0x43;
+    if(!nfc_send_recv(&c2, 8, rx, sizeof(rx), &rx_bits)) return false;
+    if((rx[0] & 0x0F) != 0x0A) return false;
+
+    return true;
+}
+
+static bool core_write_mifare_bin(const char* file_path) {
     Storage* storage = furi_record_open(RECORD_STORAGE);
     File* file = storage_file_alloc(storage);
     uint8_t dump[1024];
@@ -98,22 +113,13 @@ static bool core_write_mifare_bin(const char* file_path, bool is_ufuid) {
 
     if(bytes_read != 1024) return false;
 
-    // Se stiamo operando su UFUID, apriamo la backdoor Gen1 prima di scrivere
-    if(is_ufuid) {
-        uint8_t rx[4]; size_t rx_bits = 0;
-        uint8_t c1 = 0x40;
-        if(!nfc_send_recv(&c1, 7, rx, sizeof(rx), &rx_bits)) return false;
-        uint8_t c2 = 0x43;
-        if(!nfc_send_recv(&c2, 8, rx, sizeof(rx), &rx_bits)) return false;
-    }
-
-    // Scrittura sequenziale dei settori 1-63
+    // Scrittura sequenziale settori 1-63
     for(uint8_t i = 1; i < 64; i++) {
         if(!nfc_write_block(i, &dump[i * 16])) return false;
         furi_delay_ms(2);
     }
     
-    // Scrittura finale del Blocco 0 (Previene il brick immediato del FUID)
+    // Scrittura Blocco 0 per ultimo (Anti-Brick automatico FUID)
     if(!nfc_write_block(0, &dump[0])) return false;
 
     return true;
@@ -122,14 +128,6 @@ static bool core_write_mifare_bin(const char* file_path, bool is_ufuid) {
 static bool seal_ufuid(void) {
     uint8_t rx[4];
     size_t rx_bits = 0;
-
-    uint8_t c1 = 0x40;
-    if(!nfc_send_recv(&c1, 7, rx, sizeof(rx), &rx_bits)) return false;
-    if((rx[0] & 0x0F) != 0x0A) return false;
-
-    uint8_t c2 = 0x43;
-    if(!nfc_send_recv(&c2, 8, rx, sizeof(rx), &rx_bits)) return false;
-    if((rx[0] & 0x0F) != 0x0A) return false;
 
     uint8_t c3[4] = {0xE1, 0x00, 0, 0};
     append_crc(c3, 2);
@@ -145,7 +143,7 @@ static bool seal_ufuid(void) {
 }
 
 // =========================================================
-// INTERFACCIA UTENTE E MACCHINA A STATI
+// STRUTTURE DATI GUI E LOOP PRINCIPALE
 // =========================================================
 
 typedef enum { AppMenu, AppProcessing, AppSuccess, AppError } AppState;
@@ -157,37 +155,51 @@ typedef struct {
     FuriMessageQueue* event_queue;
 } AppContext;
 
-// Funzione hardware riscritta con le API ufficiali
+// Esecuzione NFC con LED e ciclo di ricerca attivo
 static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
     bool result = false;
     if(furi_hal_nfc_is_hal_ready() != FuriHalNfcErrorNone) return false;
 
-    // Inizializza l'hardware radio
+    // Apre il record per controllare il LED
+    NotificationApp* notifications = furi_record_open(RECORD_NOTIFICATION);
+    notification_message(notifications, &sequence_blink_start_cyan); // Lampeggio ricerca
+
     furi_hal_nfc_acquire();
     furi_hal_nfc_low_power_mode_stop();
     furi_hal_nfc_set_mode(FuriHalNfcModePoller, FuriHalNfcTechIso14443a);
-
+    furi_delay_ms(50); // Stabilizzazione antenna
+    
     uint32_t start_time = furi_get_tick();
-    bool tag_ready = false;
-
-    // Ciclo di aggancio tag (massimo 4 secondi)
-    while(furi_get_tick() - start_time < 4000) {
+    
+    // Ciclo di aggancio tag (Massimo 5 secondi)
+    while(furi_get_tick() - start_time < 5000) {
         if(nfc_iso14443a_wake_and_select()) {
-            tag_ready = true;
-            break;
+            
+            // Indipendentemente se è FUID o UFUID, apriamo la backdoor Gen1
+            if(unlock_gen1_backdoor()) {
+                if(action_index == 0 || action_index == 1) {
+                    result = core_write_mifare_bin(file_path);
+                } else if(action_index == 2) {
+                    result = seal_ufuid();
+                }
+                break; // Usciamo dal loop dopo aver eseguito l'operazione
+            }
         }
-        furi_delay_ms(50); // Attesa prima del prossimo tentativo WUPA
+        furi_delay_ms(100);
     }
 
-    if(tag_ready) {
-        if(action_index == 0) result = core_write_mifare_bin(file_path, false); // FUID
-        else if(action_index == 1) result = core_write_mifare_bin(file_path, true);  // UFUID
-        else if(action_index == 2) result = seal_ufuid(); // Sigillatura
-    }
-
-    // Spegnimento sicuro dell'antenna e rilascio
     furi_hal_nfc_low_power_mode_start();
     furi_hal_nfc_release();
+
+    // Feedback visivo finale
+    notification_message(notifications, &sequence_blink_stop);
+    if(result) {
+        notification_message(notifications, &sequence_success); // Luce verde + beep
+    } else {
+        notification_message(notifications, &sequence_error); // Luce rossa + beep lungo
+    }
+    furi_record_close(RECORD_NOTIFICATION);
+
     return result;
 }
 
@@ -197,7 +209,7 @@ static void draw_callback(Canvas* canvas, void* ctx) {
     canvas_set_font(canvas, FontPrimary);
 
     if(context->state == AppMenu) {
-        canvas_draw_str_aligned(canvas, 64, 5, AlignCenter, AlignTop, "Seleziona Azione");
+        canvas_draw_str_aligned(canvas, 64, 5, AlignCenter, AlignTop, "UFUID Sealer v1.2");
         canvas_set_font(canvas, FontSecondary);
         for(uint8_t i = 0; i < 3; i++) {
             if(i == context->menu_index) {
@@ -212,16 +224,18 @@ static void draw_callback(Canvas* canvas, void* ctx) {
     } else if(context->state == AppProcessing) {
         canvas_draw_str_aligned(canvas, 64, 25, AlignCenter, AlignCenter, "Avvicina il TAG...");
         canvas_set_font(canvas, FontSecondary);
-        canvas_draw_str_aligned(canvas, 64, 40, AlignCenter, AlignCenter, "Ricerca in corso...");
+        canvas_draw_str_aligned(canvas, 64, 40, AlignCenter, AlignCenter, "Ricerca in corso (LED Azzurro)");
     } else if(context->state == AppSuccess) {
         canvas_draw_str_aligned(canvas, 64, 25, AlignCenter, AlignCenter, "SUCCESSO!");
         canvas_set_font(canvas, FontSecondary);
-        canvas_draw_str_aligned(canvas, 64, 40, AlignCenter, AlignCenter, "Premi BACK per tornare");
+        canvas_draw_str_aligned(canvas, 64, 40, AlignCenter, AlignCenter, "Operazione completata");
+        canvas_draw_str_aligned(canvas, 64, 50, AlignCenter, AlignCenter, "Premi BACK per tornare");
     } else if(context->state == AppError) {
-        canvas_draw_str_aligned(canvas, 64, 25, AlignCenter, AlignCenter, "ERRORE");
+        canvas_draw_str_aligned(canvas, 64, 20, AlignCenter, AlignCenter, "ERRORE");
         canvas_set_font(canvas, FontSecondary);
-        canvas_draw_str_aligned(canvas, 64, 40, AlignCenter, AlignCenter, "Tag non rilevato o fallito");
-        canvas_draw_str_aligned(canvas, 64, 50, AlignCenter, AlignCenter, "Premi BACK");
+        canvas_draw_str_aligned(canvas, 64, 35, AlignCenter, AlignCenter, "Tag non letto o fallito.");
+        canvas_draw_str_aligned(canvas, 64, 45, AlignCenter, AlignCenter, "Riprova e tieni fermo il tag.");
+        canvas_draw_str_aligned(canvas, 64, 55, AlignCenter, AlignCenter, "Premi BACK");
     }
 }
 
@@ -266,6 +280,7 @@ int32_t ufuid_sealer_app(void* p) {
                         bool go_ahead = true;
                         FuriString* file_path = furi_string_alloc();
                         
+                        // Chiama il File Picker solo per scrivere
                         if (context->menu_index == 0 || context->menu_index == 1) {
                             furi_string_set(file_path, EXT_PATH("nfc"));
                             
@@ -282,6 +297,7 @@ int32_t ufuid_sealer_app(void* p) {
                             context->state = AppProcessing;
                             view_port_update(view_port);
                             
+                            // Avvia il ciclo hardware NFC e i LED
                             bool success = execute_nfc_action(context->menu_index, furi_string_get_cstr(file_path));
                             
                             context->state = success ? AppSuccess : AppError;
