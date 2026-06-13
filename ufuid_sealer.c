@@ -26,7 +26,6 @@ static void append_crc(uint8_t* data, size_t len) {
     data[len + 1] = (crc >> 8) & 0xFF;
 }
 
-// Funzione Poller con corretta gestione eventi (grazie al tuo snippet)
 static bool nfc_send_recv(uint8_t* tx, size_t tx_bits, uint8_t* rx, size_t rx_max, size_t* rx_bits) {
     if(furi_hal_nfc_poller_tx(tx, tx_bits) != FuriHalNfcErrorNone) return false;
 
@@ -44,21 +43,17 @@ static bool nfc_send_recv(uint8_t* tx, size_t tx_bits, uint8_t* rx, size_t rx_ma
     return (*rx_bits > 0);
 }
 
-// Stretta di mano standard necessaria per molti cloni
 static bool nfc_iso14443a_wake_and_select(void) {
     uint8_t rx[32];
     size_t rx_bits = 0;
 
-    // 1. WUPA (0x52)
     uint8_t wupa = 0x52;
     if(!nfc_send_recv(&wupa, 7, rx, sizeof(rx), &rx_bits)) return false;
 
-    // 2. Anticollisione Livello 1
     uint8_t anticoll[2] = {0x93, 0x20};
     if(!nfc_send_recv(anticoll, 16, rx, sizeof(rx), &rx_bits)) return false;
     if(rx_bits < 40) return false; 
 
-    // 3. Select Command
     uint8_t select_cmd[9] = {0x93, 0x70, rx[0], rx[1], rx[2], rx[3], rx[4], 0, 0};
     append_crc(select_cmd, 7);
     if(!nfc_send_recv(select_cmd, 72, rx, sizeof(rx), &rx_bits)) return false;
@@ -74,7 +69,6 @@ static bool try_gen1_backdoor(void) {
     uint8_t rx[4];
     size_t  rx_bits = 0;
 
-    // Comando a 7 bit (Sblocco porta)
     uint8_t c1 = 0x40;
     if(furi_hal_nfc_poller_tx(&c1, 7) != FuriHalNfcErrorNone) return false;
 
@@ -90,7 +84,6 @@ static bool try_gen1_backdoor(void) {
     if(furi_hal_nfc_poller_rx(rx, sizeof(rx), &rx_bits) != FuriHalNfcErrorNone) return false;
     if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
 
-    // Comando a 8 bit (Conferma)
     uint8_t c2 = 0x43;
     if(!nfc_send_recv(&c2, 8, rx, sizeof(rx), &rx_bits)) return false;
     if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
@@ -98,12 +91,9 @@ static bool try_gen1_backdoor(void) {
     return true;
 }
 
-// Logica Universale per tag Magici
 static bool prepare_magic_tag(void) {
-    // Tenta lo sblocco diretto (Tag in stato IDLE)
     if(try_gen1_backdoor()) return true;
 
-    // Se fallisce, alcuni tag richiedono risveglio e HALT preventivo
     if(nfc_iso14443a_wake_and_select()) {
         uint8_t halt[4] = {0x50, 0x00, 0x00, 0x00};
         size_t rx_bits;
@@ -117,7 +107,7 @@ static bool prepare_magic_tag(void) {
 }
 
 // =========================================================
-// MOTORE DI SCRITTURA E SIGILLATURA
+// MOTORE DI SCRITTURA E SIGILLATURA (FIX CRASH MEMORIA)
 // =========================================================
 
 static bool nfc_write_block(uint8_t block_num, uint8_t* data) {
@@ -138,29 +128,42 @@ static bool nfc_write_block(uint8_t block_num, uint8_t* data) {
 }
 
 static bool core_write_mifare_bin(const char* file_path) {
-    Storage* storage    = furi_record_open(RECORD_STORAGE);
-    File* file       = storage_file_alloc(storage);
-    uint8_t  dump[1024];
-    size_t   bytes_read = 0;
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    File* file = storage_file_alloc(storage);
+    
+    // FIX: Allocazione dinamica nella HEAP per evitare lo Stack Overflow!
+    uint8_t* dump = malloc(1024);
+    size_t bytes_read = 0;
 
     if(storage_file_open(file, file_path, FSAM_READ, FSOM_OPEN_EXISTING)) {
-        bytes_read = storage_file_read(file, dump, sizeof(dump));
+        bytes_read = storage_file_read(file, dump, 1024);
     }
     storage_file_close(file);
     storage_file_free(file);
     furi_record_close(RECORD_STORAGE);
 
-    if(bytes_read != 1024) return false;
+    if(bytes_read != 1024) {
+        free(dump); // Pulisce la memoria in caso di errore
+        return false;
+    }
 
-    // Scrive blocchi 1-63
+    bool success = true;
     for(uint8_t i = 1; i < 64; i++) {
-        if(!nfc_write_block(i, &dump[i * 16])) return false;
+        if(!nfc_write_block(i, &dump[i * 16])) {
+            success = false;
+            break;
+        }
         furi_delay_ms(2);
     }
-    // Scrive il Blocco 0 alla fine (Protezione Brick)
-    if(!nfc_write_block(0, &dump[0])) return false;
+    
+    if(success) {
+        if(!nfc_write_block(0, &dump[0])) {
+            success = false;
+        }
+    }
 
-    return true;
+    free(dump); // Pulisce la memoria alla fine del lavoro
+    return success;
 }
 
 static bool seal_ufuid(void) {
@@ -189,8 +192,6 @@ static bool seal_ufuid(void) {
 static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
     bool result = false;
 
-    // BUG RISOLTO QUI: Rimosso il controllo errato che bloccava il flusso.
-    
     NotificationApp* notifications = furi_record_open(RECORD_NOTIFICATION);
     notification_message(notifications, &sequence_blink_start_cyan);
 
@@ -199,9 +200,7 @@ static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
 
     uint32_t start_time = furi_get_tick();
 
-    // Ciclo di aggancio tag e scrittura (5 secondi)
     while(furi_get_tick() - start_time < 5000) {
-        // Garantisce che il tag sia agganciato e pronto prima di procedere
         if(prepare_magic_tag()) {
             if(action_index == 0 || action_index == 1) {
                 result = core_write_mifare_bin(file_path);
@@ -213,7 +212,6 @@ static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
         furi_delay_ms(100);
     }
 
-    // Spegnimento Sicuro Hardware
     furi_hal_nfc_low_power_mode_start();
     furi_hal_nfc_release();
 
@@ -247,7 +245,7 @@ static void draw_callback(Canvas* canvas, void* ctx) {
     canvas_set_font(canvas, FontPrimary);
 
     if(context->state == AppMenu) {
-        canvas_draw_str_aligned(canvas, 64, 5, AlignCenter, AlignTop, "UFUID Sealer v1.7");
+        canvas_draw_str_aligned(canvas, 64, 5, AlignCenter, AlignTop, "UFUID Sealer v1.8");
         canvas_set_font(canvas, FontSecondary);
         for(uint8_t i = 0; i < 3; i++) {
             if(i == context->menu_index) {
@@ -263,7 +261,7 @@ static void draw_callback(Canvas* canvas, void* ctx) {
         canvas_draw_str_aligned(canvas, 64, 25, AlignCenter, AlignCenter, "Avvicina il TAG...");
         canvas_set_font(canvas, FontSecondary);
         canvas_draw_str_aligned(
-            canvas, 64, 40, AlignCenter, AlignCenter, "Ricerca in corso (LED Azzurro)");
+            canvas, 64, 40, AlignCenter, AlignCenter, "Scrittura in corso...");
     } else if(context->state == AppSuccess) {
         canvas_draw_str_aligned(canvas, 64, 25, AlignCenter, AlignCenter, "SUCCESSO!");
         canvas_set_font(canvas, FontSecondary);
@@ -275,7 +273,7 @@ static void draw_callback(Canvas* canvas, void* ctx) {
         canvas_draw_str_aligned(canvas, 64, 20, AlignCenter, AlignCenter, "ERRORE");
         canvas_set_font(canvas, FontSecondary);
         canvas_draw_str_aligned(
-            canvas, 64, 35, AlignCenter, AlignCenter, "Tag non letto o fallito.");
+            canvas, 64, 35, AlignCenter, AlignCenter, "Tag non letto o file errato");
         canvas_draw_str_aligned(
             canvas, 64, 45, AlignCenter, AlignCenter, "Riprova e tieni fermo il tag.");
         canvas_draw_str_aligned(canvas, 64, 55, AlignCenter, AlignCenter, "Premi BACK");
