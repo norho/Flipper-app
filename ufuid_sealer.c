@@ -9,6 +9,7 @@
 #include <string.h>
 
 #define TAG "UFUID_Sealer"
+#define NFC_EVENT_TIMEOUT_MS 200
 
 // =========================================================
 // HELPER NFC E CALCOLI
@@ -26,6 +27,7 @@ static void append_crc(uint8_t* data, size_t len) {
     data[len + 1] = (crc >> 8) & 0xFF;
 }
 
+// FIX PRINCIPALE: usa furi_hal_nfc_wait_event_common con loop
 static bool nfc_send_recv(
     uint8_t* tx,
     size_t tx_bits,
@@ -35,11 +37,19 @@ static bool nfc_send_recv(
 
     if(furi_hal_nfc_poller_tx(tx, tx_bits) != FuriHalNfcErrorNone) return false;
 
-    FuriHalNfcEvent event = furi_hal_nfc_poller_wait_event(200);
+    FuriHalNfcEvent event = 0;
+    uint32_t timeout_ms = NFC_EVENT_TIMEOUT_MS;
 
-    if(event & FuriHalNfcEventTimeout)   return false;
-    if(event & FuriHalNfcEventCollision) return false;
-    if(!(event & FuriHalNfcEventRxEnd))  return false;
+    // Loop di attesa evento come da codice ufficiale Flipper
+    while(timeout_ms > 0) {
+        event = furi_hal_nfc_wait_event_common(10);
+        timeout_ms -= 10;
+        if(event & FuriHalNfcEventRxEnd) break;
+        if(event & FuriHalNfcEventTimeout) return false;
+        if(event & FuriHalNfcEventCollision) return false;
+    }
+
+    if(timeout_ms == 0) return false;
 
     if(furi_hal_nfc_poller_rx(rx, rx_max, rx_bits) != FuriHalNfcErrorNone) return false;
 
@@ -50,19 +60,31 @@ static bool nfc_iso14443a_wake_and_select(void) {
     uint8_t rx[32];
     size_t  rx_bits = 0;
 
+    // WUPA via funzione dedicata ISO14443a
     FuriHalNfcError err = furi_hal_nfc_iso14443a_poller_trx_short_frame(
         FuriHalNfcaShortFrameAllReq);
     if(err != FuriHalNfcErrorNone) return false;
 
-    FuriHalNfcEvent event = furi_hal_nfc_poller_wait_event(100);
-    if(!(event & FuriHalNfcEventRxEnd)) return false;
-    if(furi_hal_nfc_poller_rx(rx, sizeof(rx), &rx_bits) != FuriHalNfcErrorNone) return false;
-    if(rx_bits < 16) return false;
+    // Attesa ATQA con loop
+    FuriHalNfcEvent event = 0;
+    uint32_t timeout_ms = 100;
+    while(timeout_ms > 0) {
+        event = furi_hal_nfc_wait_event_common(10);
+        timeout_ms -= 10;
+        if(event & FuriHalNfcEventRxEnd) break;
+        if(event & FuriHalNfcEventTimeout) return false;
+    }
+    if(timeout_ms == 0) return false;
 
+    if(furi_hal_nfc_poller_rx(rx, sizeof(rx), &rx_bits) != FuriHalNfcErrorNone) return false;
+    if(rx_bits < 16) return false; // ATQA = 2 byte
+
+    // Anti-collisione
     uint8_t anticoll[2] = {0x93, 0x20};
     if(!nfc_send_recv(anticoll, 16, rx, sizeof(rx), &rx_bits)) return false;
     if(rx_bits < 40) return false;
 
+    // Select
     uint8_t select_cmd[9];
     select_cmd[0] = 0x93;
     select_cmd[1] = 0x70;
@@ -81,14 +103,24 @@ static bool unlock_gen1_backdoor(void) {
     uint8_t rx[4];
     size_t  rx_bits = 0;
 
+    // 0x40 a 7 bit
     uint8_t c1 = 0x40;
     if(furi_hal_nfc_poller_tx(&c1, 7) != FuriHalNfcErrorNone) return false;
 
-    FuriHalNfcEvent event = furi_hal_nfc_poller_wait_event(100);
-    if(!(event & FuriHalNfcEventRxEnd)) return false;
+    FuriHalNfcEvent event = 0;
+    uint32_t timeout_ms = 100;
+    while(timeout_ms > 0) {
+        event = furi_hal_nfc_wait_event_common(10);
+        timeout_ms -= 10;
+        if(event & FuriHalNfcEventRxEnd) break;
+        if(event & FuriHalNfcEventTimeout) return false;
+    }
+    if(timeout_ms == 0) return false;
+
     if(furi_hal_nfc_poller_rx(rx, sizeof(rx), &rx_bits) != FuriHalNfcErrorNone) return false;
     if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
 
+    // 0x43 a 8 bit
     uint8_t c2 = 0x43;
     if(!nfc_send_recv(&c2, 8, rx, sizeof(rx), &rx_bits)) return false;
     if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
@@ -128,11 +160,11 @@ static bool core_write_mifare_bin(const char* file_path) {
 
     if(bytes_read != 1024) return false;
 
+    // Blocchi 1-63 prima, blocco 0 per ultimo (anti-brick FUID)
     for(uint8_t i = 1; i < 64; i++) {
         if(!nfc_write_block(i, &dump[i * 16])) return false;
         furi_delay_ms(2);
     }
-
     if(!nfc_write_block(0, &dump[0])) return false;
 
     return true;
@@ -171,10 +203,7 @@ static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
 
     furi_hal_nfc_acquire();
     furi_hal_nfc_low_power_mode_stop();
-
-    // Firma corretta: 2 argomenti
     furi_hal_nfc_set_mode(FuriHalNfcModePoller, FuriHalNfcTechIso14443a);
-
     furi_delay_ms(50);
 
     uint32_t start_time = furi_get_tick();
@@ -211,12 +240,7 @@ static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
 // GUI
 // =========================================================
 
-typedef enum {
-    AppMenu,
-    AppProcessing,
-    AppSuccess,
-    AppError
-} AppState;
+typedef enum { AppMenu, AppProcessing, AppSuccess, AppError } AppState;
 
 typedef struct {
     AppState          state;
@@ -231,7 +255,7 @@ static void draw_callback(Canvas* canvas, void* ctx) {
     canvas_set_font(canvas, FontPrimary);
 
     if(context->state == AppMenu) {
-        canvas_draw_str_aligned(canvas, 64, 5, AlignCenter, AlignTop, "UFUID Sealer v1.3");
+        canvas_draw_str_aligned(canvas, 64, 5, AlignCenter, AlignTop, "UFUID Sealer v1.4");
         canvas_set_font(canvas, FontSecondary);
         for(uint8_t i = 0; i < 3; i++) {
             if(i == context->menu_index) {
@@ -307,19 +331,16 @@ int32_t ufuid_sealer_app(void* p) {
                     } else if(event.key == InputKeyDown) {
                         if(context->menu_index < 2) context->menu_index++;
                     } else if(event.key == InputKeyOk) {
-
                         bool        go_ahead  = true;
                         FuriString* file_path = furi_string_alloc();
 
                         if(context->menu_index == 0 || context->menu_index == 1) {
                             furi_string_set(file_path, EXT_PATH("nfc"));
-
                             DialogsApp*               dialogs = furi_record_open(RECORD_DIALOGS);
                             DialogsFileBrowserOptions browser_options;
                             dialog_file_browser_set_basic_options(
                                 &browser_options, ".bin", NULL);
                             browser_options.base_path = EXT_PATH("nfc");
-
                             go_ahead = dialog_file_browser_show(
                                 dialogs, file_path, file_path, &browser_options);
                             furi_record_close(RECORD_DIALOGS);
@@ -328,10 +349,8 @@ int32_t ufuid_sealer_app(void* p) {
                         if(go_ahead) {
                             context->state = AppProcessing;
                             view_port_update(view_port);
-
                             bool success = execute_nfc_action(
                                 context->menu_index, furi_string_get_cstr(file_path));
-
                             context->state = success ? AppSuccess : AppError;
                             view_port_update(view_port);
                         }
