@@ -26,17 +26,17 @@ static void append_crc(uint8_t* data, size_t len) {
     data[len + 1] = (crc >> 8) & 0xFF;
 }
 
+// Funzione Poller con corretta gestione eventi (grazie al tuo snippet)
 static bool nfc_send_recv(uint8_t* tx, size_t tx_bits, uint8_t* rx, size_t rx_max, size_t* rx_bits) {
     if(furi_hal_nfc_poller_tx(tx, tx_bits) != FuriHalNfcErrorNone) return false;
 
     FuriHalNfcEvent event = 0;
-    uint32_t timeout_ms = 100; // Timeout rapido per non bloccare il sistema
+    uint32_t timeout_ms = 150;
     while(timeout_ms > 0) {
         event = furi_hal_nfc_poller_wait_event(10);
         timeout_ms -= 10;
         if(event & FuriHalNfcEventRxEnd) break;
         if(event & FuriHalNfcEventTimeout) return false;
-        if(event & FuriHalNfcEventCollision) return false;
     }
     if(timeout_ms == 0) return false;
 
@@ -44,21 +44,21 @@ static bool nfc_send_recv(uint8_t* tx, size_t tx_bits, uint8_t* rx, size_t rx_ma
     return (*rx_bits > 0);
 }
 
-// Stretta di mano standard necessaria per FUID e alcuni UFUID moderni
+// Stretta di mano standard necessaria per molti cloni
 static bool nfc_iso14443a_wake_and_select(void) {
     uint8_t rx[32];
     size_t rx_bits = 0;
 
-    // 1. WUPA (0x52) - Risveglia tutti i tag nel campo
+    // 1. WUPA (0x52)
     uint8_t wupa = 0x52;
     if(!nfc_send_recv(&wupa, 7, rx, sizeof(rx), &rx_bits)) return false;
 
-    // 2. Anticollisione (0x93 0x20) - Raccoglie l'UID
+    // 2. Anticollisione Livello 1
     uint8_t anticoll[2] = {0x93, 0x20};
     if(!nfc_send_recv(anticoll, 16, rx, sizeof(rx), &rx_bits)) return false;
-    if(rx_bits < 40) return false; // Ci aspettiamo UID (4 byte) + BCC (1 byte)
+    if(rx_bits < 40) return false; 
 
-    // 3. Select (0x93 0x70 + UID + BCC) - Mette il tag in stato ACTIVE
+    // 3. Select Command
     uint8_t select_cmd[9] = {0x93, 0x70, rx[0], rx[1], rx[2], rx[3], rx[4], 0, 0};
     append_crc(select_cmd, 7);
     if(!nfc_send_recv(select_cmd, 72, rx, sizeof(rx), &rx_bits)) return false;
@@ -67,14 +67,14 @@ static bool nfc_iso14443a_wake_and_select(void) {
 }
 
 // =========================================================
-// BACKDOOR GEN1 (Per UFUID)
+// BACKDOOR GEN1 (FUID / UFUID)
 // =========================================================
 
 static bool try_gen1_backdoor(void) {
     uint8_t rx[4];
     size_t  rx_bits = 0;
 
-    // 0x40 a 7 bit — Apertura serratura
+    // Comando a 7 bit (Sblocco porta)
     uint8_t c1 = 0x40;
     if(furi_hal_nfc_poller_tx(&c1, 7) != FuriHalNfcErrorNone) return false;
 
@@ -90,7 +90,7 @@ static bool try_gen1_backdoor(void) {
     if(furi_hal_nfc_poller_rx(rx, sizeof(rx), &rx_bits) != FuriHalNfcErrorNone) return false;
     if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
 
-    // 0x43 a 8 bit — Conferma sblocco
+    // Comando a 8 bit (Conferma)
     uint8_t c2 = 0x43;
     if(!nfc_send_recv(&c2, 8, rx, sizeof(rx), &rx_bits)) return false;
     if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
@@ -98,8 +98,26 @@ static bool try_gen1_backdoor(void) {
     return true;
 }
 
+// Logica Universale per tag Magici
+static bool prepare_magic_tag(void) {
+    // Tenta lo sblocco diretto (Tag in stato IDLE)
+    if(try_gen1_backdoor()) return true;
+
+    // Se fallisce, alcuni tag richiedono risveglio e HALT preventivo
+    if(nfc_iso14443a_wake_and_select()) {
+        uint8_t halt[4] = {0x50, 0x00, 0x00, 0x00};
+        size_t rx_bits;
+        uint8_t rx[4];
+        append_crc(halt, 2);
+        nfc_send_recv(halt, 32, rx, sizeof(rx), &rx_bits);
+        furi_delay_ms(5);
+        return try_gen1_backdoor();
+    }
+    return false;
+}
+
 // =========================================================
-// MOTORE DI SCRITTURA
+// MOTORE DI SCRITTURA E SIGILLATURA
 // =========================================================
 
 static bool nfc_write_block(uint8_t block_num, uint8_t* data) {
@@ -134,10 +152,12 @@ static bool core_write_mifare_bin(const char* file_path) {
 
     if(bytes_read != 1024) return false;
 
+    // Scrive blocchi 1-63
     for(uint8_t i = 1; i < 64; i++) {
         if(!nfc_write_block(i, &dump[i * 16])) return false;
         furi_delay_ms(2);
     }
+    // Scrive il Blocco 0 alla fine (Protezione Brick)
     if(!nfc_write_block(0, &dump[0])) return false;
 
     return true;
@@ -163,44 +183,14 @@ static bool seal_ufuid(void) {
 }
 
 // =========================================================
-// PREPARAZIONE E LOGICA DI AGGANCIO TAG
-// =========================================================
-
-static void reset_rf_field(void) {
-    furi_hal_nfc_low_power_mode_start(); // Spegne
-    furi_delay_ms(30);
-    furi_hal_nfc_low_power_mode_stop();  // Accende
-    furi_delay_ms(30);
-}
-
-static bool prepare_fuid(void) {
-    // I FUID sono Gen2: Richiedono sempre Wake e Select standard ISO14443A
-    reset_rf_field();
-    return nfc_iso14443a_wake_and_select();
-}
-
-static bool prepare_ufuid(void) {
-    // Gli UFUID sono Gen1/Ibridi: Proviamo prima l'accesso diretto
-    reset_rf_field();
-    if(try_gen1_backdoor()) return true;
-
-    // Se fallisce, alcuni lotti UFUID richiedono Wake e Select PRIMA della backdoor
-    reset_rf_field();
-    if(nfc_iso14443a_wake_and_select()) {
-        return try_gen1_backdoor();
-    }
-    return false;
-}
-
-// =========================================================
 // ESECUZIONE NFC PRINCIPALE
 // =========================================================
 
 static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
     bool result = false;
 
-    if(furi_hal_nfc_is_hal_ready() != FuriHalNfcErrorNone) return false;
-
+    // BUG RISOLTO QUI: Rimosso il controllo errato che bloccava il flusso.
+    
     NotificationApp* notifications = furi_record_open(RECORD_NOTIFICATION);
     notification_message(notifications, &sequence_blink_start_cyan);
 
@@ -209,33 +199,24 @@ static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
 
     uint32_t start_time = furi_get_tick();
 
-    // Ciclo di ricerca: tenta l'aggancio per 5 secondi
+    // Ciclo di aggancio tag e scrittura (5 secondi)
     while(furi_get_tick() - start_time < 5000) {
-        bool tag_ready = false;
-
-        if (action_index == 0) {
-            tag_ready = prepare_fuid();
-        } else {
-            tag_ready = prepare_ufuid();
-        }
-
-        if(tag_ready) {
+        // Garantisce che il tag sia agganciato e pronto prima di procedere
+        if(prepare_magic_tag()) {
             if(action_index == 0 || action_index == 1) {
                 result = core_write_mifare_bin(file_path);
             } else if(action_index == 2) {
                 result = seal_ufuid();
             }
-            break; // Esci dal ciclo se agganciato, con successo o errore
+            break; 
         }
-        
         furi_delay_ms(100);
     }
 
-    // Rilascio sicuro risorse hardware
+    // Spegnimento Sicuro Hardware
     furi_hal_nfc_low_power_mode_start();
     furi_hal_nfc_release();
 
-    // Gestione Feedback Visivo e Sonoro
     notification_message(notifications, &sequence_blink_stop);
     if(result) {
         notification_message(notifications, &sequence_success);
@@ -248,7 +229,7 @@ static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
 }
 
 // =========================================================
-// INTERFACCIA GRAFICA (GUI)
+// GUI E ENTRY POINT
 // =========================================================
 
 typedef enum { AppMenu, AppProcessing, AppSuccess, AppError } AppState;
@@ -266,7 +247,7 @@ static void draw_callback(Canvas* canvas, void* ctx) {
     canvas_set_font(canvas, FontPrimary);
 
     if(context->state == AppMenu) {
-        canvas_draw_str_aligned(canvas, 64, 5, AlignCenter, AlignTop, "UFUID Sealer v1.6");
+        canvas_draw_str_aligned(canvas, 64, 5, AlignCenter, AlignTop, "UFUID Sealer v1.7");
         canvas_set_font(canvas, FontSecondary);
         for(uint8_t i = 0; i < 3; i++) {
             if(i == context->menu_index) {
@@ -305,10 +286,6 @@ static void input_callback(InputEvent* input_event, void* ctx) {
     AppContext* context = ctx;
     furi_message_queue_put(context->event_queue, input_event, FuriWaitForever);
 }
-
-// =========================================================
-// ENTRY POINT
-// =========================================================
 
 int32_t ufuid_sealer_app(void* p) {
     UNUSED(p);
