@@ -11,7 +11,7 @@
 #define TAG "UFUID_Sealer"
 
 // =========================================================
-// HELPER
+// HELPER E PROTOCOLLI RADIO ISO14443A
 // =========================================================
 
 static void append_crc(uint8_t* data, size_t len) {
@@ -26,22 +26,16 @@ static void append_crc(uint8_t* data, size_t len) {
     data[len + 1] = (crc >> 8) & 0xFF;
 }
 
-static bool nfc_send_recv(
-    uint8_t* tx,
-    size_t   tx_bits,
-    uint8_t* rx,
-    size_t   rx_max,
-    size_t*  rx_bits) {
-
+static bool nfc_send_recv(uint8_t* tx, size_t tx_bits, uint8_t* rx, size_t rx_max, size_t* rx_bits) {
     if(furi_hal_nfc_poller_tx(tx, tx_bits) != FuriHalNfcErrorNone) return false;
 
     FuriHalNfcEvent event = 0;
-    uint32_t timeout_ms = 200;
+    uint32_t timeout_ms = 100; // Timeout rapido per non bloccare il sistema
     while(timeout_ms > 0) {
         event = furi_hal_nfc_poller_wait_event(10);
         timeout_ms -= 10;
-        if(event & FuriHalNfcEventRxEnd)     break;
-        if(event & FuriHalNfcEventTimeout)   return false;
+        if(event & FuriHalNfcEventRxEnd) break;
+        if(event & FuriHalNfcEventTimeout) return false;
         if(event & FuriHalNfcEventCollision) return false;
     }
     if(timeout_ms == 0) return false;
@@ -50,16 +44,37 @@ static bool nfc_send_recv(
     return (*rx_bits > 0);
 }
 
+// Stretta di mano standard necessaria per FUID e alcuni UFUID moderni
+static bool nfc_iso14443a_wake_and_select(void) {
+    uint8_t rx[32];
+    size_t rx_bits = 0;
+
+    // 1. WUPA (0x52) - Risveglia tutti i tag nel campo
+    uint8_t wupa = 0x52;
+    if(!nfc_send_recv(&wupa, 7, rx, sizeof(rx), &rx_bits)) return false;
+
+    // 2. Anticollisione (0x93 0x20) - Raccoglie l'UID
+    uint8_t anticoll[2] = {0x93, 0x20};
+    if(!nfc_send_recv(anticoll, 16, rx, sizeof(rx), &rx_bits)) return false;
+    if(rx_bits < 40) return false; // Ci aspettiamo UID (4 byte) + BCC (1 byte)
+
+    // 3. Select (0x93 0x70 + UID + BCC) - Mette il tag in stato ACTIVE
+    uint8_t select_cmd[9] = {0x93, 0x70, rx[0], rx[1], rx[2], rx[3], rx[4], 0, 0};
+    append_crc(select_cmd, 7);
+    if(!nfc_send_recv(select_cmd, 72, rx, sizeof(rx), &rx_bits)) return false;
+
+    return true;
+}
+
 // =========================================================
-// BACKDOOR GEN1 — tenta direttamente senza wake/select
-// Alcuni tag Gen1 rispondono a 0x40(7bit) senza WUPA prima
+// BACKDOOR GEN1 (Per UFUID)
 // =========================================================
 
 static bool try_gen1_backdoor(void) {
     uint8_t rx[4];
     size_t  rx_bits = 0;
 
-    // 0x40 a 7 bit — backdoor knock
+    // 0x40 a 7 bit — Apertura serratura
     uint8_t c1 = 0x40;
     if(furi_hal_nfc_poller_tx(&c1, 7) != FuriHalNfcErrorNone) return false;
 
@@ -75,7 +90,7 @@ static bool try_gen1_backdoor(void) {
     if(furi_hal_nfc_poller_rx(rx, sizeof(rx), &rx_bits) != FuriHalNfcErrorNone) return false;
     if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
 
-    // 0x43 a 8 bit — confirm backdoor
+    // 0x43 a 8 bit — Conferma sblocco
     uint8_t c2 = 0x43;
     if(!nfc_send_recv(&c2, 8, rx, sizeof(rx), &rx_bits)) return false;
     if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
@@ -84,7 +99,7 @@ static bool try_gen1_backdoor(void) {
 }
 
 // =========================================================
-// SCRITTURA
+// MOTORE DI SCRITTURA
 // =========================================================
 
 static bool nfc_write_block(uint8_t block_num, uint8_t* data) {
@@ -106,7 +121,7 @@ static bool nfc_write_block(uint8_t block_num, uint8_t* data) {
 
 static bool core_write_mifare_bin(const char* file_path) {
     Storage* storage    = furi_record_open(RECORD_STORAGE);
-    File*    file       = storage_file_alloc(storage);
+    File* file       = storage_file_alloc(storage);
     uint8_t  dump[1024];
     size_t   bytes_read = 0;
 
@@ -148,7 +163,37 @@ static bool seal_ufuid(void) {
 }
 
 // =========================================================
-// ESECUZIONE NFC
+// PREPARAZIONE E LOGICA DI AGGANCIO TAG
+// =========================================================
+
+static void reset_rf_field(void) {
+    furi_hal_nfc_low_power_mode_start(); // Spegne
+    furi_delay_ms(30);
+    furi_hal_nfc_low_power_mode_stop();  // Accende
+    furi_delay_ms(30);
+}
+
+static bool prepare_fuid(void) {
+    // I FUID sono Gen2: Richiedono sempre Wake e Select standard ISO14443A
+    reset_rf_field();
+    return nfc_iso14443a_wake_and_select();
+}
+
+static bool prepare_ufuid(void) {
+    // Gli UFUID sono Gen1/Ibridi: Proviamo prima l'accesso diretto
+    reset_rf_field();
+    if(try_gen1_backdoor()) return true;
+
+    // Se fallisce, alcuni lotti UFUID richiedono Wake e Select PRIMA della backdoor
+    reset_rf_field();
+    if(nfc_iso14443a_wake_and_select()) {
+        return try_gen1_backdoor();
+    }
+    return false;
+}
+
+// =========================================================
+// ESECUZIONE NFC PRINCIPALE
 // =========================================================
 
 static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
@@ -160,30 +205,37 @@ static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
     notification_message(notifications, &sequence_blink_start_cyan);
 
     furi_hal_nfc_acquire();
-    furi_hal_nfc_low_power_mode_stop();
     furi_hal_nfc_set_mode(FuriHalNfcModePoller, FuriHalNfcTechIso14443a);
-    furi_delay_ms(50);
 
     uint32_t start_time = furi_get_tick();
 
+    // Ciclo di ricerca: tenta l'aggancio per 5 secondi
     while(furi_get_tick() - start_time < 5000) {
+        bool tag_ready = false;
 
-        // Tenta backdoor diretta — senza wake/select preventivo
-        if(try_gen1_backdoor()) {
+        if (action_index == 0) {
+            tag_ready = prepare_fuid();
+        } else {
+            tag_ready = prepare_ufuid();
+        }
+
+        if(tag_ready) {
             if(action_index == 0 || action_index == 1) {
                 result = core_write_mifare_bin(file_path);
             } else if(action_index == 2) {
                 result = seal_ufuid();
             }
-            break;
+            break; // Esci dal ciclo se agganciato, con successo o errore
         }
-
+        
         furi_delay_ms(100);
     }
 
+    // Rilascio sicuro risorse hardware
     furi_hal_nfc_low_power_mode_start();
     furi_hal_nfc_release();
 
+    // Gestione Feedback Visivo e Sonoro
     notification_message(notifications, &sequence_blink_stop);
     if(result) {
         notification_message(notifications, &sequence_success);
@@ -196,7 +248,7 @@ static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
 }
 
 // =========================================================
-// GUI
+// INTERFACCIA GRAFICA (GUI)
 // =========================================================
 
 typedef enum { AppMenu, AppProcessing, AppSuccess, AppError } AppState;
@@ -204,7 +256,7 @@ typedef enum { AppMenu, AppProcessing, AppSuccess, AppError } AppState;
 typedef struct {
     AppState          state;
     uint8_t           menu_index;
-    const char*       menu_items[3];
+    const char* menu_items[3];
     FuriMessageQueue* event_queue;
 } AppContext;
 
@@ -214,7 +266,7 @@ static void draw_callback(Canvas* canvas, void* ctx) {
     canvas_set_font(canvas, FontPrimary);
 
     if(context->state == AppMenu) {
-        canvas_draw_str_aligned(canvas, 64, 5, AlignCenter, AlignTop, "UFUID Sealer v1.5");
+        canvas_draw_str_aligned(canvas, 64, 5, AlignCenter, AlignTop, "UFUID Sealer v1.6");
         canvas_set_font(canvas, FontSecondary);
         for(uint8_t i = 0; i < 3; i++) {
             if(i == context->menu_index) {
@@ -295,7 +347,7 @@ int32_t ufuid_sealer_app(void* p) {
 
                         if(context->menu_index == 0 || context->menu_index == 1) {
                             furi_string_set(file_path, EXT_PATH("nfc"));
-                            DialogsApp*               dialogs = furi_record_open(RECORD_DIALOGS);
+                            DialogsApp* dialogs = furi_record_open(RECORD_DIALOGS);
                             DialogsFileBrowserOptions browser_options;
                             dialog_file_browser_set_basic_options(
                                 &browser_options, ".bin", NULL);
