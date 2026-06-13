@@ -40,15 +40,12 @@ static bool nfc_send_recv(uint8_t* tx, size_t tx_bits, uint8_t* rx, size_t rx_ma
             rx_success = true;
             break;
         }
-        
-        // Timeout puro
         if((event & FuriHalNfcEventTimeout) && !(event & FuriHalNfcEventRxEnd)) {
             break; 
         }
     }
 
     if(!rx_success) return false;
-
     if(furi_hal_nfc_poller_rx(rx, rx_max, rx_bits) != FuriHalNfcErrorNone) return false;
     return (*rx_bits > 0);
 }
@@ -89,16 +86,34 @@ static bool nfc_iso14443a_wake_and_select(void) {
 }
 
 // =========================================================
-// BACKDOOR GEN1 E GEN2 (FUID / UFUID)
+// SEQUENZE BACKDOOR BASE
 // =========================================================
 
 static bool try_gen1_backdoor(void) {
     uint8_t rx[32];
     size_t  rx_bits = 0;
 
-    FURI_LOG_I(TAG, "TRY BACKDOOR GEN1");
+    FURI_LOG_I(TAG, "TRY BACKDOOR GEN1 COLD");
     uint8_t c1 = 0x40;
     
+    if(!nfc_send_recv(&c1, 7, rx, sizeof(rx), &rx_bits)) return false;
+    if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
+
+    uint8_t c2 = 0x43;
+    if(!nfc_send_recv(&c2, 8, rx, sizeof(rx), &rx_bits)) return false;
+    if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
+
+    return true;
+}
+
+static bool try_gen1_wake_backdoor(void) {
+    uint8_t rx[32];
+    size_t  rx_bits = 0;
+
+    FURI_LOG_I(TAG, "TRY BACKDOOR GEN1 WAKE");
+    if(!nfc_iso14443a_wake_and_select()) return false;
+
+    uint8_t c1 = 0x40;
     if(!nfc_send_recv(&c1, 7, rx, sizeof(rx), &rx_bits)) return false;
     if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
 
@@ -113,12 +128,11 @@ static bool try_gen2_backdoor(void) {
     uint8_t rx[32];
     size_t rx_bits = 0;
 
-    FURI_LOG_I(TAG, "TRY BACKDOOR GEN2");
+    FURI_LOG_I(TAG, "TRY BACKDOOR GEN2 (UFUID)");
     if(!nfc_iso14443a_wake_and_select()) return false;
 
     uint8_t auth_cmd[] = {0x60, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00};
     append_crc(auth_cmd, 8);
-    
     if(!nfc_send_recv(auth_cmd, 80, rx, sizeof(rx), &rx_bits)) return false;
     if(rx_bits < 32) return false; 
 
@@ -133,7 +147,28 @@ static bool try_gen2_backdoor(void) {
     return true;
 }
 
-static bool prepare_magic_tag(void) {
+// =========================================================
+// MOTORI ISOLATI (FUID e UFUID)
+// =========================================================
+
+static bool prepare_fuid_tag(void) {
+    // Pipeline aggressiva per cloni Gen1 (FUID)
+    if(try_gen1_backdoor()) return true;
+
+    force_hardware_reset();
+    if(try_gen1_wake_backdoor()) return true;
+
+    force_hardware_reset();
+    if(nfc_iso14443a_wake_and_select()) {
+        nfc_send_halt_only();
+        force_hardware_reset();
+        if(try_gen1_backdoor()) return true;
+    }
+    return false;
+}
+
+static bool prepare_ufuid_tag(void) {
+    // Pipeline intoccabile certificata AMS Bambu per Gen2 (UFUID)
     if(try_gen1_backdoor()) return true;
 
     force_hardware_reset();
@@ -148,7 +183,7 @@ static bool prepare_magic_tag(void) {
     return false;
 }
 // =========================================================
-// MOTORE DI SCRITTURA E SIGILLATURA CON LOG CAPILLARI
+// MOTORE DI SCRITTURA E SIGILLATURA
 // =========================================================
 
 static bool nfc_write_block(uint8_t block_num, uint8_t* data) {
@@ -173,7 +208,6 @@ static bool nfc_write_block(uint8_t block_num, uint8_t* data) {
         FURI_LOG_E(TAG, "Write B%d DATA Timeout", block_num);
         return false;
     }
-
     if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) {
         FURI_LOG_E(TAG, "Write B%d DATA NAK", block_num);
         return false;
@@ -244,7 +278,7 @@ static bool seal_ufuid(void) {
 }
 
 // =========================================================
-// ESECUZIONE NFC PRINCIPALE (SINGLE THREAD SICURO)
+// ROUTER ESECUZIONE NFC
 // =========================================================
 
 static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
@@ -257,13 +291,21 @@ static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
     furi_hal_nfc_low_power_mode_stop();
     furi_hal_nfc_set_mode(FuriHalNfcModePoller, FuriHalNfcTechIso14443a);
     furi_hal_nfc_poller_field_on();
-    
     furi_delay_ms(40);
 
     uint32_t start_time = furi_get_tick();
 
     while(furi_get_tick() - start_time < 5000) {
-        if(prepare_magic_tag()) {
+        bool tag_ready = false;
+        
+        // Routing isolato basato sulla selezione dell'utente
+        if (action_index == 0) {
+            tag_ready = prepare_fuid_tag();
+        } else {
+            tag_ready = prepare_ufuid_tag();
+        }
+
+        if(tag_ready) {
             if(action_index == 0 || action_index == 1) {
                 result = core_write_mifare_bin(file_path);
             } else if(action_index == 2) {
@@ -307,7 +349,7 @@ static void draw_callback(Canvas* canvas, void* ctx) {
     canvas_set_font(canvas, FontPrimary);
 
     if(context->state == AppMenu) {
-        canvas_draw_str_aligned(canvas, 64, 5, AlignCenter, AlignTop, "UFUID Sealer v7.0");
+        canvas_draw_str_aligned(canvas, 64, 5, AlignCenter, AlignTop, "UFUID Sealer v8.0");
         canvas_set_font(canvas, FontSecondary);
         for(uint8_t i = 0; i < 3; i++) {
             if(i == context->menu_index) {
