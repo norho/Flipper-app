@@ -172,11 +172,8 @@ static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
     furi_hal_nfc_acquire();
     furi_hal_nfc_low_power_mode_stop();
 
-    furi_hal_nfc_set_mode(
-        FuriHalNfcModePoller,
-        FuriHalNfcBitrateFc128,
-        FuriHalNfcBitrateFc128,
-        FuriHalNfcTechIso14443a);
+    // Firma corretta: 2 argomenti
+    furi_hal_nfc_set_mode(FuriHalNfcModePoller, FuriHalNfcTechIso14443a);
 
     furi_delay_ms(50);
 
