@@ -26,20 +26,22 @@ static void append_crc(uint8_t* data, size_t len) {
     data[len + 1] = (crc >> 8) & 0xFF;
 }
 
-// FIX: Delega totale all'OS. Niente più cicli while problematici.
 static bool nfc_send_recv(uint8_t* tx, size_t tx_bits, uint8_t* rx, size_t rx_max, size_t* rx_bits) {
     furi_thread_flags_clear(0xFFFFFFFF);
-    if(furi_hal_nfc_poller_tx(tx, tx_bits) != FuriHalNfcErrorNone) return false;
+    
+    if(furi_hal_nfc_poller_tx(tx, tx_bits) != FuriHalNfcErrorNone) {
+        FURI_LOG_E(TAG, "TX FAILED");
+        return false;
+    }
 
-    // Attesa bloccante nativa (100ms sono enormi e sicuri per NFC)
     FuriHalNfcEvent event = furi_hal_nfc_poller_wait_event(100);
     
     if(event & FuriHalNfcEventRxEnd) {
         if(furi_hal_nfc_poller_rx(rx, rx_max, rx_bits) == FuriHalNfcErrorNone) {
             return (*rx_bits > 0);
         }
-    } else if (event != 0) {
-        FURI_LOG_W(TAG, "TX %zu bits TIMEOUT/ERR: 0x%08lx", tx_bits, (uint32_t)event);
+    } else {
+        FURI_LOG_W(TAG, "TX %zu bits ERR/TMO: 0x%08lx", tx_bits, (uint32_t)event);
     }
     return false;
 }
@@ -49,17 +51,16 @@ static void nfc_send_halt_only(void) {
     append_crc(halt, 2);
     furi_thread_flags_clear(0xFFFFFFFF);
     furi_hal_nfc_poller_tx(halt, 32);
-    furi_hal_nfc_poller_wait_event(10); // Pausa per far assorbire il comando
+    furi_hal_nfc_poller_wait_event(10); 
 }
 
-// FIX CRITICO: Aggiunto field_on e tempo di ricarica del condensatore del tag
-static void reset_nfc_poller(void) {
+// FIX CRITICO: Forza il chip ST25 a spegnersi e riaccendersi (Ciclo Hardware profondo)
+static void force_hardware_reset(void) {
     furi_hal_nfc_low_power_mode_start(); 
-    furi_delay_ms(15);
+    furi_delay_ms(20);
     furi_hal_nfc_low_power_mode_stop();  
     furi_hal_nfc_set_mode(FuriHalNfcModePoller, FuriHalNfcTechIso14443a);
-    furi_hal_nfc_poller_field_on(); 
-    furi_delay_ms(40); // Il tag si accende fisicamente in questo istante
+    furi_delay_ms(20); 
 }
 
 static bool nfc_iso14443a_wake_and_select(void) {
@@ -93,7 +94,10 @@ static bool try_gen1_backdoor(void) {
     uint8_t c1 = 0x40;
     
     furi_thread_flags_clear(0xFFFFFFFF);
-    if(furi_hal_nfc_poller_tx(&c1, 7) != FuriHalNfcErrorNone) return false;
+    if(furi_hal_nfc_poller_tx(&c1, 7) != FuriHalNfcErrorNone) {
+        FURI_LOG_E(TAG, "GEN1 TX FAIL - RADIO OFF");
+        return false;
+    }
 
     FuriHalNfcEvent event = furi_hal_nfc_poller_wait_event(100);
     if(event & FuriHalNfcEventRxEnd) {
@@ -138,13 +142,13 @@ static bool try_gen2_backdoor(void) {
 static bool prepare_magic_tag(void) {
     if(try_gen1_backdoor()) return true;
 
-    reset_nfc_poller();
+    force_hardware_reset();
     if(try_gen2_backdoor()) return true;
 
-    reset_nfc_poller();
+    force_hardware_reset();
     if(nfc_iso14443a_wake_and_select()) {
         nfc_send_halt_only();
-        reset_nfc_poller();
+        force_hardware_reset();
         if(try_gen1_backdoor()) return true;
     }
     return false;
@@ -233,7 +237,7 @@ static bool seal_ufuid(void) {
 }
 
 // =========================================================
-// ESECUZIONE NFC PRINCIPALE
+// ESECUZIONE NFC PRINCIPALE (FIX RADIO START)
 // =========================================================
 
 static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
@@ -242,13 +246,11 @@ static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
     NotificationApp* notifications = furi_record_open(RECORD_NOTIFICATION);
     notification_message(notifications, &sequence_blink_start_cyan);
 
+    // FIX: Sequenza infallibile per accendere il chip RF in dev
     furi_hal_nfc_acquire();
     furi_hal_nfc_low_power_mode_stop();
     furi_hal_nfc_set_mode(FuriHalNfcModePoller, FuriHalNfcTechIso14443a);
-    furi_hal_nfc_poller_field_on();
-    
-    // FIX CRITICO: Diamo tempo al condensatore del tag di caricarsi fisicamente
-    furi_delay_ms(40); 
+    furi_delay_ms(50); // Attendiamo che l'hardware si stabilizzi
 
     uint32_t start_time = furi_get_tick();
 
@@ -261,7 +263,9 @@ static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
             }
             break; 
         }
-        furi_delay_ms(100);
+        
+        // Pausa di rispetto radio
+        furi_delay_ms(50); 
     }
 
     furi_hal_nfc_low_power_mode_start();
@@ -297,7 +301,7 @@ static void draw_callback(Canvas* canvas, void* ctx) {
     canvas_set_font(canvas, FontPrimary);
 
     if(context->state == AppMenu) {
-        canvas_draw_str_aligned(canvas, 64, 5, AlignCenter, AlignTop, "UFUID Sealer v2.8");
+        canvas_draw_str_aligned(canvas, 64, 5, AlignCenter, AlignTop, "UFUID Sealer v2.9");
         canvas_set_font(canvas, FontSecondary);
         for(uint8_t i = 0; i < 3; i++) {
             if(i == context->menu_index) {
@@ -321,7 +325,7 @@ static void draw_callback(Canvas* canvas, void* ctx) {
     } else if(context->state == AppError) {
         canvas_draw_str_aligned(canvas, 64, 20, AlignCenter, AlignCenter, "ERRORE");
         canvas_set_font(canvas, FontSecondary);
-        canvas_draw_str_aligned(canvas, 64, 35, AlignCenter, AlignCenter, "Tag non letto o fallito");
+        canvas_draw_str_aligned(canvas, 64, 35, AlignCenter, AlignCenter, "Radio Error / Tag non letto");
         canvas_draw_str_aligned(canvas, 64, 45, AlignCenter, AlignCenter, "Riprova e tieni fermo.");
         canvas_draw_str_aligned(canvas, 64, 55, AlignCenter, AlignCenter, "Premi BACK");
     }
