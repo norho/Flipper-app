@@ -40,7 +40,7 @@ static bool nfc_iso14443a_wake_and_select(void) {
     uint8_t rx[32];
     size_t rx_bits = 0;
     
-    // 1. WUPA (Wake-Up All - 0x52 a 7 bit)
+    // 1. WUPA (Wake-Up All - 0x52 a 7 bit) - Risveglia i tag nel campo RF
     uint8_t wupa = 0x52;
     if(!nfc_send_recv(&wupa, 7, rx, sizeof(rx), &rx_bits)) return false;
     
@@ -118,6 +118,7 @@ static bool core_write_mifare_bin(const char* file_path, bool is_ufuid) {
 
     return true;
 }
+
 static bool seal_ufuid(void) {
     uint8_t rx[4];
     size_t rx_bits = 0;
@@ -164,22 +165,18 @@ static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
     // Inizializza l'hardware radio
     furi_hal_nfc_acquire();
     furi_hal_nfc_low_power_mode_stop();
+    furi_hal_nfc_set_mode(FuriHalNfcModePoller, FuriHalNfcTechIso14443a);
 
     uint32_t start_time = furi_get_tick();
     bool tag_ready = false;
 
     // Ciclo di aggancio tag (massimo 4 secondi)
     while(furi_get_tick() - start_time < 4000) {
-        // FIX: Riavvio del campo usando le API standard supportate
-        furi_hal_nfc_set_mode(FuriHalNfcModeOff, FuriHalNfcTechIso14443a);
-        furi_delay_ms(15);
-        furi_hal_nfc_set_mode(FuriHalNfcModePoller, FuriHalNfcTechIso14443a);
-        furi_delay_ms(15);
-
         if(nfc_iso14443a_wake_and_select()) {
             tag_ready = true;
             break;
         }
+        furi_delay_ms(50); // Attesa prima del prossimo tentativo WUPA
     }
 
     if(tag_ready) {
