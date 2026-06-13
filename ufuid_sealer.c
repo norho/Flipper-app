@@ -47,14 +47,6 @@ static bool nfc_send_recv(uint8_t* tx, size_t tx_bits, uint8_t* rx, size_t rx_ma
     return (*rx_bits > 0);
 }
 
-static void nfc_send_halt_only(void) {
-    uint8_t halt[4] = {0x50, 0x00, 0x00, 0x00};
-    append_crc(halt, 2);
-    furi_thread_flags_clear(0xFFFFFFFF);
-    furi_hal_nfc_poller_tx(halt, 32);
-    furi_hal_nfc_poller_wait_event(20);
-}
-
 static void force_hardware_reset(uint32_t ms_charge) {
     furi_hal_nfc_low_power_mode_start();
     furi_delay_ms(15);
@@ -65,20 +57,18 @@ static void force_hardware_reset(uint32_t ms_charge) {
 }
 
 // =========================================================
-// WAKE+SELECT — FIX: usa short_frame per WUPA a 7 bit
-// Usato SOLO per FUID. UFUID usa il proprio flow invariato.
+// WAKE+SELECT — usa short_frame per WUPA a 7 bit
+// Usato da FUID e UFUID
 // =========================================================
 
 static bool nfc_iso14443a_wake_and_select(void) {
     uint8_t rx[32];
     size_t  rx_bits = 0;
 
-    // WUPA corretto: short frame dedicato, niente poller_tx raw
     FuriHalNfcError err = furi_hal_nfc_iso14443a_poller_trx_short_frame(
         FuriHalNfcaShortFrameAllReq);
     if(err != FuriHalNfcErrorNone) return false;
 
-    // Attesa ATQA
     bool rx_ok = false;
     uint32_t t = furi_get_tick();
     while(furi_get_tick() - t < 100) {
@@ -90,12 +80,10 @@ static bool nfc_iso14443a_wake_and_select(void) {
     if(furi_hal_nfc_poller_rx(rx, sizeof(rx), &rx_bits) != FuriHalNfcErrorNone) return false;
     if(rx_bits < 16) return false;
 
-    // Anticollisione
     uint8_t anticoll[2] = {0x93, 0x20};
     if(!nfc_send_recv(anticoll, 16, rx, sizeof(rx), &rx_bits)) return false;
     if(rx_bits < 32) return false;
 
-    // Select
     uint8_t select_cmd[9] = {0x93, 0x70, rx[0], rx[1], rx[2], rx[3], rx[4], 0, 0};
     append_crc(select_cmd, 7);
     if(!nfc_send_recv(select_cmd, 72, rx, sizeof(rx), &rx_bits)) return false;
@@ -104,7 +92,7 @@ static bool nfc_iso14443a_wake_and_select(void) {
 }
 
 // =========================================================
-// BACKDOOR GEN1 — invariata, funziona per entrambi
+// BACKDOOR GEN1 — invariata
 // =========================================================
 
 static bool gen1_magic_knock(void) {
@@ -135,8 +123,7 @@ static bool gen1_magic_knock(void) {
 }
 
 // =========================================================
-// PREPARE FUID — FIX: wake+select con short_frame poi knock
-// Strategia unica lineare: reset → wake → select → backdoor
+// PREPARE FUID — wake+select con short_frame poi knock
 // =========================================================
 
 static bool prepare_fuid_tag(void) {
@@ -155,7 +142,7 @@ static bool prepare_fuid_tag(void) {
 }
 
 // =========================================================
-// PREPARE UFUID — INVARIATO, funziona già
+// PREPARE UFUID — invariato, funziona già
 // =========================================================
 
 static bool prepare_ufuid_tag(void) {
@@ -274,8 +261,6 @@ static bool seal_ufuid(void) {
 
 // =========================================================
 // ROUTER ESECUZIONE NFC
-// FIX: FUID fa reset campo prima di ogni tentativo wake+select
-// UFUID invariato
 // =========================================================
 
 static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
@@ -300,7 +285,7 @@ static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
             force_hardware_reset(40);
             tag_ready = prepare_fuid_tag();
         } else {
-            // UFUID: logica invariata che già funziona
+            // UFUID: logica invariata
             tag_ready = prepare_ufuid_tag();
             if(!tag_ready) {
                 force_hardware_reset(40);
