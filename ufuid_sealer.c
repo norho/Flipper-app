@@ -26,44 +26,40 @@ static void append_crc(uint8_t* data, size_t len) {
     data[len + 1] = (crc >> 8) & 0xFF;
 }
 
+// FIX: Delega totale all'OS. Niente più cicli while problematici.
 static bool nfc_send_recv(uint8_t* tx, size_t tx_bits, uint8_t* rx, size_t rx_max, size_t* rx_bits) {
     furi_thread_flags_clear(0xFFFFFFFF);
     if(furi_hal_nfc_poller_tx(tx, tx_bits) != FuriHalNfcErrorNone) return false;
 
-    FuriHalNfcEvent event = 0;
-    uint32_t timeout_ms = 150;
-    while(timeout_ms > 0) {
-        event = furi_hal_nfc_poller_wait_event(10);
-        timeout_ms -= 10;
-        
-        if (event != 0) {
-            FURI_LOG_I(TAG, "SEND_RECV EVENT=0x%08lx", (uint32_t)event);
+    // Attesa bloccante nativa (100ms sono enormi e sicuri per NFC)
+    FuriHalNfcEvent event = furi_hal_nfc_poller_wait_event(100);
+    
+    if(event & FuriHalNfcEventRxEnd) {
+        if(furi_hal_nfc_poller_rx(rx, rx_max, rx_bits) == FuriHalNfcErrorNone) {
+            return (*rx_bits > 0);
         }
-
-        // Priorità assoluta a RxEnd, anche se c'è un flag di Timeout combinato
-        if(event & FuriHalNfcEventRxEnd) break;
-        if(event & FuriHalNfcEventTimeout) return false;
-        if(event & FuriHalNfcEventCollision) return false;
+    } else if (event != 0) {
+        FURI_LOG_W(TAG, "TX %zu bits TIMEOUT/ERR: 0x%08lx", tx_bits, (uint32_t)event);
     }
-    if(timeout_ms == 0) return false;
-
-    if(furi_hal_nfc_poller_rx(rx, rx_max, rx_bits) != FuriHalNfcErrorNone) return false;
-    return (*rx_bits > 0);
+    return false;
 }
 
 static void nfc_send_halt_only(void) {
     uint8_t halt[4] = {0x50, 0x00, 0x00, 0x00};
     append_crc(halt, 2);
+    furi_thread_flags_clear(0xFFFFFFFF);
     furi_hal_nfc_poller_tx(halt, 32);
-    furi_delay_ms(5); 
+    furi_hal_nfc_poller_wait_event(10); // Pausa per far assorbire il comando
 }
 
+// FIX CRITICO: Aggiunto field_on e tempo di ricarica del condensatore del tag
 static void reset_nfc_poller(void) {
     furi_hal_nfc_low_power_mode_start(); 
-    furi_delay_ms(10);
+    furi_delay_ms(15);
     furi_hal_nfc_low_power_mode_stop();  
     furi_hal_nfc_set_mode(FuriHalNfcModePoller, FuriHalNfcTechIso14443a);
-    furi_delay_ms(10);
+    furi_hal_nfc_poller_field_on(); 
+    furi_delay_ms(40); // Il tag si accende fisicamente in questo istante
 }
 
 static bool nfc_iso14443a_wake_and_select(void) {
@@ -76,13 +72,7 @@ static bool nfc_iso14443a_wake_and_select(void) {
     uint8_t anticoll[2] = {0x93, 0x20};
     if(!nfc_send_recv(anticoll, 16, rx, sizeof(rx), &rx_bits)) return false;
     
-    FURI_LOG_I(TAG, "ANTICOLL RX_BITS=%zu", rx_bits);
-    
-    // Sicurezza di memoria: Garantiamo i 5 byte (UID+BCC)
-    if(rx_bits < 40) {
-        FURI_LOG_I(TAG, "ANTICOLL TOO SHORT=%zu", rx_bits);
-        return false; 
-    }
+    if(rx_bits < 32) return false; 
 
     uint8_t select_cmd[9] = {0x93, 0x70, rx[0], rx[1], rx[2], rx[3], rx[4], 0, 0};
     append_crc(select_cmd, 7);
@@ -92,37 +82,50 @@ static bool nfc_iso14443a_wake_and_select(void) {
 }
 
 // =========================================================
-// BACKDOOR GEN1 E PREPARAZIONE
+// BACKDOOR GEN1 E GEN2 (FUID / UFUID)
 // =========================================================
 
 static bool try_gen1_backdoor(void) {
     uint8_t rx[32];
     size_t  rx_bits = 0;
 
-    FURI_LOG_I(TAG, "TRY BACKDOOR");
-
+    FURI_LOG_I(TAG, "TRY BACKDOOR GEN1");
     uint8_t c1 = 0x40;
+    
+    furi_thread_flags_clear(0xFFFFFFFF);
     if(furi_hal_nfc_poller_tx(&c1, 7) != FuriHalNfcErrorNone) return false;
 
-    FuriHalNfcEvent event = 0;
-    uint32_t timeout_ms = 100;
-    while(timeout_ms > 0) {
-        event = furi_hal_nfc_poller_wait_event(10);
-        timeout_ms -= 10;
-        
-        if (event != 0) {
-            FURI_LOG_I(TAG, "40 EVENT=0x%08lx", (uint32_t)event);
-        }
-
-        if(event & FuriHalNfcEventRxEnd) break;
+    FuriHalNfcEvent event = furi_hal_nfc_poller_wait_event(100);
+    if(event & FuriHalNfcEventRxEnd) {
+        if(furi_hal_nfc_poller_rx(rx, sizeof(rx), &rx_bits) != FuriHalNfcErrorNone) return false;
+        if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
+    } else {
+        FURI_LOG_W(TAG, "40 EVENT FAIL: 0x%08lx", (uint32_t)event);
+        return false;
     }
-    
-    if(timeout_ms == 0) return false;
 
-    if(furi_hal_nfc_poller_rx(rx, sizeof(rx), &rx_bits) != FuriHalNfcErrorNone) return false;
+    uint8_t c2 = 0x43;
+    if(!nfc_send_recv(&c2, 8, rx, sizeof(rx), &rx_bits)) return false;
+    if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
+
+    return true;
+}
+
+static bool try_gen2_backdoor(void) {
+    uint8_t rx[32];
+    size_t rx_bits = 0;
+
+    FURI_LOG_I(TAG, "TRY BACKDOOR GEN2");
+    if(!nfc_iso14443a_wake_and_select()) return false;
+
+    uint8_t auth_cmd[] = {0x60, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00};
+    append_crc(auth_cmd, 8);
     
-    FURI_LOG_I(TAG, "40 RX_BITS=%zu", rx_bits);
-    
+    if(!nfc_send_recv(auth_cmd, 80, rx, sizeof(rx), &rx_bits)) return false;
+    if(rx_bits < 32) return false; 
+
+    uint8_t c1 = 0x40;
+    if(!nfc_send_recv(&c1, 7, rx, sizeof(rx), &rx_bits)) return false;
     if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
 
     uint8_t c2 = 0x43;
@@ -136,14 +139,14 @@ static bool prepare_magic_tag(void) {
     if(try_gen1_backdoor()) return true;
 
     reset_nfc_poller();
+    if(try_gen2_backdoor()) return true;
 
+    reset_nfc_poller();
     if(nfc_iso14443a_wake_and_select()) {
         nfc_send_halt_only();
         reset_nfc_poller();
-        return try_gen1_backdoor();
+        if(try_gen1_backdoor()) return true;
     }
-    
-    reset_nfc_poller();
     return false;
 }
 // =========================================================
@@ -242,6 +245,10 @@ static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
     furi_hal_nfc_acquire();
     furi_hal_nfc_low_power_mode_stop();
     furi_hal_nfc_set_mode(FuriHalNfcModePoller, FuriHalNfcTechIso14443a);
+    furi_hal_nfc_poller_field_on();
+    
+    // FIX CRITICO: Diamo tempo al condensatore del tag di caricarsi fisicamente
+    furi_delay_ms(40); 
 
     uint32_t start_time = furi_get_tick();
 
@@ -290,7 +297,7 @@ static void draw_callback(Canvas* canvas, void* ctx) {
     canvas_set_font(canvas, FontPrimary);
 
     if(context->state == AppMenu) {
-        canvas_draw_str_aligned(canvas, 64, 5, AlignCenter, AlignTop, "UFUID Sealer v2.3");
+        canvas_draw_str_aligned(canvas, 64, 5, AlignCenter, AlignTop, "UFUID Sealer v2.8");
         canvas_set_font(canvas, FontSecondary);
         for(uint8_t i = 0; i < 3; i++) {
             if(i == context->menu_index) {
@@ -305,22 +312,17 @@ static void draw_callback(Canvas* canvas, void* ctx) {
     } else if(context->state == AppProcessing) {
         canvas_draw_str_aligned(canvas, 64, 25, AlignCenter, AlignCenter, "Avvicina il TAG...");
         canvas_set_font(canvas, FontSecondary);
-        canvas_draw_str_aligned(
-            canvas, 64, 40, AlignCenter, AlignCenter, "Scrittura in corso...");
+        canvas_draw_str_aligned(canvas, 64, 40, AlignCenter, AlignCenter, "Scrittura in corso...");
     } else if(context->state == AppSuccess) {
         canvas_draw_str_aligned(canvas, 64, 25, AlignCenter, AlignCenter, "SUCCESSO!");
         canvas_set_font(canvas, FontSecondary);
-        canvas_draw_str_aligned(
-            canvas, 64, 40, AlignCenter, AlignCenter, "Operazione completata");
-        canvas_draw_str_aligned(
-            canvas, 64, 50, AlignCenter, AlignCenter, "Premi BACK per tornare");
+        canvas_draw_str_aligned(canvas, 64, 40, AlignCenter, AlignCenter, "Operazione completata");
+        canvas_draw_str_aligned(canvas, 64, 50, AlignCenter, AlignCenter, "Premi BACK per tornare");
     } else if(context->state == AppError) {
         canvas_draw_str_aligned(canvas, 64, 20, AlignCenter, AlignCenter, "ERRORE");
         canvas_set_font(canvas, FontSecondary);
-        canvas_draw_str_aligned(
-            canvas, 64, 35, AlignCenter, AlignCenter, "Leggi log (qFlipper)");
-        canvas_draw_str_aligned(
-            canvas, 64, 45, AlignCenter, AlignCenter, "Riprova e tieni fermo.");
+        canvas_draw_str_aligned(canvas, 64, 35, AlignCenter, AlignCenter, "Tag non letto o fallito");
+        canvas_draw_str_aligned(canvas, 64, 45, AlignCenter, AlignCenter, "Riprova e tieni fermo.");
         canvas_draw_str_aligned(canvas, 64, 55, AlignCenter, AlignCenter, "Premi BACK");
     }
 }
@@ -369,19 +371,16 @@ int32_t ufuid_sealer_app(void* p) {
                             furi_string_set(file_path, EXT_PATH("nfc"));
                             DialogsApp* dialogs = furi_record_open(RECORD_DIALOGS);
                             DialogsFileBrowserOptions browser_options;
-                            dialog_file_browser_set_basic_options(
-                                &browser_options, ".bin", NULL);
+                            dialog_file_browser_set_basic_options(&browser_options, ".bin", NULL);
                             browser_options.base_path = EXT_PATH("nfc");
-                            go_ahead = dialog_file_browser_show(
-                                dialogs, file_path, file_path, &browser_options);
+                            go_ahead = dialog_file_browser_show(dialogs, file_path, file_path, &browser_options);
                             furi_record_close(RECORD_DIALOGS);
                         }
 
                         if(go_ahead) {
                             context->state = AppProcessing;
                             view_port_update(view_port);
-                            bool success = execute_nfc_action(
-                                context->menu_index, furi_string_get_cstr(file_path));
+                            bool success = execute_nfc_action(context->menu_index, furi_string_get_cstr(file_path));
                             context->state = success ? AppSuccess : AppError;
                             view_port_update(view_port);
                         }
