@@ -21,23 +21,22 @@ static void append_crc(uint8_t* data, size_t len) {
     data[len+1] = (crc >> 8) & 0xFF;
 }
 
-// Helper: Gestione trasmissione e ricezione Raw con Poller API
+// FIX: Polling attivo corretto senza addormentare il thread
 static bool nfc_send_recv(
     uint8_t* tx, size_t tx_bits,
     uint8_t* rx, size_t rx_max, size_t* rx_bits,
     uint32_t timeout_ms) {
     
-    furi_thread_flags_clear(0xFFFFFFFF);
     FuriHalNfcError err = furi_hal_nfc_poller_tx(tx, tx_bits);
     if(err != FuriHalNfcErrorNone) return false;
 
     uint32_t start = furi_get_tick();
     while((furi_get_tick() - start) < timeout_ms) {
-        furi_thread_flags_wait(0xFFFFFFFF, FuriFlagWaitAny, timeout_ms);
         err = furi_hal_nfc_poller_rx(rx, rx_max, rx_bits);
         if(err == FuriHalNfcErrorNone && *rx_bits > 0) {
             return true;
         }
+        furi_delay_ms(1); // Yield sicuro al sistema operativo
     }
     return false;
 }
@@ -49,93 +48,83 @@ static bool nfc_write_block(uint8_t block_num, uint8_t* data) {
 
     uint8_t cmd[4] = {0xA0, block_num, 0, 0};
     append_crc(cmd, 2);
-    if(!nfc_send_recv(cmd, 32, rx, sizeof(rx), &rx_bits, 20)) return false;
+    if(!nfc_send_recv(cmd, 32, rx, sizeof(rx), &rx_bits, 50)) return false;
     if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
 
     uint8_t write_data[18];
     memcpy(write_data, data, 16);
     append_crc(write_data, 16);
-    if(!nfc_send_recv(write_data, 144, rx, sizeof(rx), &rx_bits, 20)) return false;
+    if(!nfc_send_recv(write_data, 144, rx, sizeof(rx), &rx_bits, 50)) return false;
     
     return (rx_bits >= 4 && (rx[0] & 0x0F) == 0x0A);
 }
 
-// =========================================================
-// MOTORE CONDIVISO CON FILE PATH DINAMICO
-// =========================================================
+// FIX: Lettura in RAM e sequenza di sblocco obbligatoria
 static bool core_write_mifare_bin(const char* file_path) {
     Storage* storage = furi_record_open(RECORD_STORAGE);
     File* file = storage_file_alloc(storage);
-    bool success = true;
+    uint8_t dump[1024];
+    size_t bytes_read = 0;
 
+    // 1. Carica tutto il dump in RAM istantaneamente
     if(storage_file_open(file, file_path, FSAM_READ, FSOM_OPEN_EXISTING)) {
-        uint8_t block_data[16];
-        uint8_t block0_data[16]; 
-        uint8_t block_num = 0;
-        bool has_block0 = false;
-        
-        while(storage_file_read(file, block_data, 16) == 16) {
-            if(block_num == 0) {
-                memcpy(block0_data, block_data, 16);
-                has_block0 = true;
-            } else {
-                if(!nfc_write_block(block_num, block_data)) {
-                    success = false;
-                    break;
-                }
-            }
-            block_num++;
-            furi_delay_ms(10); 
-        }
-
-        if(success && has_block0) {
-            if(!nfc_write_block(0, block0_data)) {
-                success = false;
-            }
-        }
-    } else {
-        FURI_LOG_E(TAG, "File non trovato: %s", file_path);
-        success = false;
+        bytes_read = storage_file_read(file, dump, sizeof(dump));
     }
-
     storage_file_close(file);
     storage_file_free(file);
     furi_record_close(RECORD_STORAGE);
-    return success;
+
+    if(bytes_read != 1024) {
+        FURI_LOG_E(TAG, "File non valido o non di 1024 byte");
+        return false;
+    }
+
+    // 2. Sequenza di sblocco obbligatoria per far accettare la scrittura
+    uint8_t rx[4];
+    size_t rx_bits = 0;
+    uint8_t c1 = 0x40;
+    if(!nfc_send_recv(&c1, 7, rx, sizeof(rx), &rx_bits, 50) || (rx[0] & 0x0F) != 0x0A) return false;
+    
+    uint8_t c2 = 0x43;
+    if(!nfc_send_recv(&c2, 8, rx, sizeof(rx), &rx_bits, 50) || (rx[0] & 0x0F) != 0x0A) return false;
+
+    // 3. Scrittura sicura dalla RAM (Senza il blocco 0)
+    for(uint8_t i = 1; i < 64; i++) {
+        if(!nfc_write_block(i, &dump[i * 16])) return false;
+        furi_delay_ms(2);
+    }
+
+    // 4. Scrittura Blocco 0 alla fine per evitare blocchi anticipati
+    if(!nfc_write_block(0, &dump[0])) return false;
+
+    return true;
 }
 
-// =========================================================
-// WRAPPER LOGICI E FUNZIONI NFC
-// =========================================================
-static bool write_fuid(const char* file_path) {
-    return core_write_mifare_bin(file_path);
-}
-
-static bool write_ufuid(const char* file_path) {
-    return core_write_mifare_bin(file_path);
-}
+// Wrapper logici
+static bool write_fuid(const char* file_path) { return core_write_mifare_bin(file_path); }
+static bool write_ufuid(const char* file_path) { return core_write_mifare_bin(file_path); }
 
 static bool seal_ufuid(void) {
     uint8_t rx[4];
     size_t rx_bits = 0;
 
     uint8_t c1 = 0x40;
-    if(!nfc_send_recv(&c1, 7, rx, sizeof(rx), &rx_bits, 20)) return false;
+    if(!nfc_send_recv(&c1, 7, rx, sizeof(rx), &rx_bits, 50)) return false;
     if((rx[0] & 0x0F) != 0x0A) return false;
 
     uint8_t c2 = 0x43;
-    if(!nfc_send_recv(&c2, 8, rx, sizeof(rx), &rx_bits, 20)) return false;
+    if(!nfc_send_recv(&c2, 8, rx, sizeof(rx), &rx_bits, 50)) return false;
     if((rx[0] & 0x0F) != 0x0A) return false;
 
     uint8_t c3[4] = {0xE1, 0x00, 0, 0};
     append_crc(c3, 2);
-    if(!nfc_send_recv(c3, 32, rx, sizeof(rx), &rx_bits, 20)) return false;
+    if(!nfc_send_recv(c3, 32, rx, sizeof(rx), &rx_bits, 50)) return false;
     if((rx[0] & 0x0F) != 0x0A) return false;
 
     uint8_t seal[18] = {0x85, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
                         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0, 0};
     append_crc(seal, 16);
-    if(!nfc_send_recv(seal, 144, rx, sizeof(rx), &rx_bits, 50)) return false;
+    if(!nfc_send_recv(seal, 144, rx, sizeof(rx), &rx_bits, 60)) return false;
     
     return ((rx[0] & 0x0F) == 0x0A);
 }
