@@ -25,56 +25,38 @@ static void append_crc(uint8_t* data, size_t len) {
     data[len+1] = (crc >> 8) & 0xFF;
 }
 
-// Funzione di invio/ricezione con Polling attivo e robusto
-static bool nfc_send_recv(
-    uint8_t* tx, size_t tx_bits,
-    uint8_t* rx, size_t rx_max, size_t* rx_bits,
-    uint32_t timeout_ms) {
-    
-    FuriHalNfcError err = furi_hal_nfc_poller_tx(tx, tx_bits);
-    if(err != FuriHalNfcErrorNone) return false;
-
-    uint32_t start = furi_get_tick();
-    while((furi_get_tick() - start) < timeout_ms) {
-        furi_delay_ms(2); // Dà tempo al tag di elaborare
-        err = furi_hal_nfc_poller_rx(rx, rx_max, rx_bits);
-        if(err == FuriHalNfcErrorNone && *rx_bits > 0) {
-            return true;
-        }
-    }
-    return false;
+// FIX: Delega totale dell'attesa all'HAL nativo del Flipper
+static bool nfc_send_recv(uint8_t* tx, size_t tx_bits, uint8_t* rx, size_t rx_max, size_t* rx_bits) {
+    if(furi_hal_nfc_poller_tx(tx, tx_bits) != FuriHalNfcErrorNone) return false;
+    // Il firmware blocca l'esecuzione qui finché non riceve dati o va in timeout hardware
+    if(furi_hal_nfc_poller_rx(rx, rx_max, rx_bits) != FuriHalNfcErrorNone) return false;
+    return (*rx_bits > 0);
 }
 
-// Protocollo obbligatorio di Risveglio e Selezione ISO14443A
+// FIX: Protocollo obbligatorio di Risveglio e Selezione ISO14443A
 static bool nfc_iso14443a_wake_and_select(void) {
-    uint8_t rx[16];
+    uint8_t rx[32];
     size_t rx_bits = 0;
     
-    // 1. REQA (Wake-up 0x26, 7-bits)
-    uint8_t reqa = 0x26;
-    if(!nfc_send_recv(&reqa, 7, rx, sizeof(rx), &rx_bits, 30)) {
-        // Fallback su WUPA se REQA fallisce
-        uint8_t wupa = 0x52;
-        if(!nfc_send_recv(&wupa, 7, rx, sizeof(rx), &rx_bits, 30)) return false;
-    }
-    if(rx_bits < 16) return false; 
+    // 1. WUPA (Wake-Up All 0x52, 7-bits) - Sveglia i tag in IDLE o HALT
+    uint8_t wupa = 0x52;
+    if(!nfc_send_recv(&wupa, 7, rx, sizeof(rx), &rx_bits)) return false;
     
     // 2. Anti-collisione Livello 1 (0x93 0x20)
     uint8_t anticoll[2] = {0x93, 0x20};
-    if(!nfc_send_recv(anticoll, 16, rx, sizeof(rx), &rx_bits, 30)) return false;
-    if(rx_bits < 40) return false; // Deve restituire 5 byte (UID + BCC)
+    if(!nfc_send_recv(anticoll, 16, rx, sizeof(rx), &rx_bits)) return false;
+    if(rx_bits < 40) return false; // Deve restituire almeno 5 byte (UID + BCC)
     
     // 3. Select (0x93 0x70 + UID + BCC + CRC)
     uint8_t select_cmd[9];
     select_cmd[0] = 0x93;
     select_cmd[1] = 0x70;
-    memcpy(&select_cmd[2], rx, 5); // Copia UID letto
+    memcpy(&select_cmd[2], rx, 5); // Copia i 5 byte appena letti
     append_crc(select_cmd, 7);
     
-    // Il comando Select è lungo 72 bit (9 byte)
-    if(!nfc_send_recv(select_cmd, 72, rx, sizeof(rx), &rx_bits, 30)) return false;
+    if(!nfc_send_recv(select_cmd, 72, rx, sizeof(rx), &rx_bits)) return false;
     
-    // Se siamo arrivati qui, il tag è ufficialmente "Sveglio" (ACTIVE)
+    // Se siamo arrivati qui, il tag è ufficialmente "Sveglio" (ACTIVE) e pronto a ricevere
     return true;
 }
 
@@ -85,23 +67,23 @@ static bool nfc_write_block(uint8_t block_num, uint8_t* data) {
 
     uint8_t cmd[4] = {0xA0, block_num, 0, 0};
     append_crc(cmd, 2);
-    if(!nfc_send_recv(cmd, 32, rx, sizeof(rx), &rx_bits, 30)) return false;
-    if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
+    if(!nfc_send_recv(cmd, 32, rx, sizeof(rx), &rx_bits)) return false;
+    if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false; // ACK = 0x0A
 
     uint8_t write_data[18];
     memcpy(write_data, data, 16);
     append_crc(write_data, 16);
-    if(!nfc_send_recv(write_data, 144, rx, sizeof(rx), &rx_bits, 30)) return false;
+    if(!nfc_send_recv(write_data, 144, rx, sizeof(rx), &rx_bits)) return false;
     
     return (rx_bits >= 4 && (rx[0] & 0x0F) == 0x0A);
 }
 
 // =========================================================
-// MOTORE DI SCRITTURA E FUNZIONI LOGICHE
+// MOTORE DI SCRITTURA E LOGICA TAG
 // =========================================================
 
-// Motore condiviso con supporto Backdoor UFUID
-static bool core_write_mifare_bin(const char* file_path, bool is_ufuid) {
+// Motore di scrittura in RAM: Carica e spara i blocchi (Gen2 Direct Write)
+static bool core_write_mifare_bin(const char* file_path) {
     Storage* storage = furi_record_open(RECORD_STORAGE);
     File* file = storage_file_alloc(storage);
     uint8_t dump[1024];
@@ -116,56 +98,49 @@ static bool core_write_mifare_bin(const char* file_path, bool is_ufuid) {
 
     if(bytes_read != 1024) return false;
 
-    // Se è UFUID, apriamo la porta sul retro dopo che è stato svegliato
-    if(is_ufuid) {
-        uint8_t rx[4]; size_t rx_bits = 0;
-        uint8_t c1 = 0x40;
-        if(!nfc_send_recv(&c1, 7, rx, sizeof(rx), &rx_bits, 30)) return false;
-        uint8_t c2 = 0x43;
-        if(!nfc_send_recv(&c2, 8, rx, sizeof(rx), &rx_bits, 30)) return false;
-    }
-
-    // Scrittura settori 1-63
+    // Scrittura sequenziale settori 1-63
     for(uint8_t i = 1; i < 64; i++) {
         if(!nfc_write_block(i, &dump[i * 16])) return false;
-        furi_delay_ms(2);
+        furi_delay_ms(1); // Pausa di sicurezza radio
     }
-    // Scrittura Blocco 0 per ultimo (Anti-Brick)
+    
+    // Scrittura Blocco 0 per ultimo (Protezione Anti-Brick FUID)
     if(!nfc_write_block(0, &dump[0])) return false;
 
     return true;
 }
 
-static bool write_fuid(const char* file_path) { return core_write_mifare_bin(file_path, false); }
-static bool write_ufuid(const char* file_path) { return core_write_mifare_bin(file_path, true); }
+static bool write_fuid(const char* file_path) { return core_write_mifare_bin(file_path); }
+static bool write_ufuid(const char* file_path) { return core_write_mifare_bin(file_path); }
 
+// Sequenza Backdoor irreversibile UFUID
 static bool seal_ufuid(void) {
     uint8_t rx[4];
     size_t rx_bits = 0;
 
     uint8_t c1 = 0x40;
-    if(!nfc_send_recv(&c1, 7, rx, sizeof(rx), &rx_bits, 30)) return false;
+    if(!nfc_send_recv(&c1, 7, rx, sizeof(rx), &rx_bits)) return false;
     if((rx[0] & 0x0F) != 0x0A) return false;
 
     uint8_t c2 = 0x43;
-    if(!nfc_send_recv(&c2, 8, rx, sizeof(rx), &rx_bits, 30)) return false;
+    if(!nfc_send_recv(&c2, 8, rx, sizeof(rx), &rx_bits)) return false;
     if((rx[0] & 0x0F) != 0x0A) return false;
 
     uint8_t c3[4] = {0xE1, 0x00, 0, 0};
     append_crc(c3, 2);
-    if(!nfc_send_recv(c3, 32, rx, sizeof(rx), &rx_bits, 30)) return false;
+    if(!nfc_send_recv(c3, 32, rx, sizeof(rx), &rx_bits)) return false;
     if((rx[0] & 0x0F) != 0x0A) return false;
 
     uint8_t seal[18] = {0x85, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
                         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0, 0};
     append_crc(seal, 16);
-    if(!nfc_send_recv(seal, 144, rx, sizeof(rx), &rx_bits, 60)) return false;
+    if(!nfc_send_recv(seal, 144, rx, sizeof(rx), &rx_bits)) return false;
     
     return ((rx[0] & 0x0F) == 0x0A);
 }
 
 // =========================================================
-// STRUTTURE DATI GUI E STATI
+// STRUTTURE DATI GUI E LOOP PRINCIPALE
 // =========================================================
 
 typedef enum { AppMenu, AppProcessing, AppSuccess, AppError } AppState;
@@ -177,40 +152,60 @@ typedef struct {
     FuriMessageQueue* event_queue;
 } AppContext;
 
-// Helper che cerca attivamente il tag svegliandolo
+// Esecuzione NFC con ciclo di ricerca attivo
 static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
     bool result = false;
     if(furi_hal_nfc_is_hal_ready() != FuriHalNfcErrorNone) return false;
 
     furi_hal_nfc_acquire();
-    furi_hal_nfc_low_power_mode_stop();
+    furi_hal_nfc_low_power_mode_stop(); // Attiva l'antenna
     furi_hal_nfc_set_mode(FuriHalNfcModePoller, FuriHalNfcTechIso14443a);
     
-    bool tag_found = false;
     uint32_t start_time = furi_get_tick();
     
-    // Cerca il tag per un massimo di 3 secondi
-    while(furi_get_tick() - start_time < 3000) {
-        if(nfc_iso14443a_wake_and_select()) {
-            tag_found = true;
-            break; // Tag trovato e svegliato, usciamo dal loop!
+    // Azioni di Scrittura (FUID / UFUID)
+    if (action_index == 0 || action_index == 1) { 
+        bool tag_found = false;
+        // Ricerca del tag per 3 secondi
+        while(furi_get_tick() - start_time < 3000) {
+            // FIX: Reset del campo per assicurare che il tag sia in IDLE
+            furi_hal_nfc_low_power_mode_start();
+            furi_delay_ms(15);
+            furi_hal_nfc_low_power_mode_stop();
+            furi_delay_ms(15);
+
+            if(nfc_iso14443a_wake_and_select()) {
+                tag_found = true;
+                break; 
+            }
         }
-        furi_delay_ms(100);
+
+        // Se l'abbiamo agganciato, scriviamo!
+        if(tag_found) {
+            if(action_index == 0) result = write_fuid(file_path);
+            else result = write_ufuid(file_path);
+        }
+        
+    // Azione di Sigillatura
+    } else if (action_index == 2) { 
+        while(furi_get_tick() - start_time < 3000) {
+            furi_hal_nfc_low_power_mode_start();
+            furi_delay_ms(15);
+            furi_hal_nfc_low_power_mode_stop();
+            furi_delay_ms(15);
+
+            if(seal_ufuid()) {
+                result = true;
+                break;
+            }
+        }
     }
 
-    // Se abbiamo agganciato il tag, eseguiamo l'operazione richiesta
-    if(tag_found) {
-        if(action_index == 0) result = write_fuid(file_path);
-        else if(action_index == 1) result = write_ufuid(file_path);
-        else if(action_index == 2) result = seal_ufuid();
-    }
-
-    furi_hal_nfc_low_power_mode_start();
+    furi_hal_nfc_low_power_mode_start(); // Spegne l'antenna
     furi_hal_nfc_release();
     return result;
 }
 
-// Callback di disegno su schermo
 static void draw_callback(Canvas* canvas, void* ctx) {
     AppContext* context = ctx;
     canvas_clear(canvas);
@@ -232,7 +227,7 @@ static void draw_callback(Canvas* canvas, void* ctx) {
     } else if(context->state == AppProcessing) {
         canvas_draw_str_aligned(canvas, 64, 25, AlignCenter, AlignCenter, "Avvicina il TAG...");
         canvas_set_font(canvas, FontSecondary);
-        canvas_draw_str_aligned(canvas, 64, 40, AlignCenter, AlignCenter, "Ricerca e scrittura...");
+        canvas_draw_str_aligned(canvas, 64, 40, AlignCenter, AlignCenter, "Ricerca in corso...");
     } else if(context->state == AppSuccess) {
         canvas_draw_str_aligned(canvas, 64, 25, AlignCenter, AlignCenter, "SUCCESSO!");
         canvas_set_font(canvas, FontSecondary);
@@ -245,16 +240,12 @@ static void draw_callback(Canvas* canvas, void* ctx) {
     }
 }
 
-// Callback per la ricezione degli input hardware
 static void input_callback(InputEvent* input_event, void* ctx) {
     AppContext* context = ctx;
     furi_message_queue_put(context->event_queue, input_event, FuriWaitForever);
 }
 
-// =========================================================
-// ENTRY POINT DELL'APPLICAZIONE
-// =========================================================
-
+// Entry Point
 int32_t ufuid_sealer_app(void* p) {
     UNUSED(p);
 
@@ -291,6 +282,7 @@ int32_t ufuid_sealer_app(void* p) {
                         bool go_ahead = true;
                         FuriString* file_path = furi_string_alloc();
                         
+                        // Chiama il File Picker solo per scrivere
                         if (context->menu_index == 0 || context->menu_index == 1) {
                             furi_string_set(file_path, EXT_PATH("nfc"));
                             
@@ -307,7 +299,7 @@ int32_t ufuid_sealer_app(void* p) {
                             context->state = AppProcessing;
                             view_port_update(view_port);
                             
-                            // Esegue il ciclo hardware corretto (Ricerca + Handshake + Scrittura)
+                            // Avvia il ciclo hardware NFC!
                             bool success = execute_nfc_action(context->menu_index, furi_string_get_cstr(file_path));
                             
                             context->state = success ? AppSuccess : AppError;
