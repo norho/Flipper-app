@@ -51,14 +51,6 @@ static bool nfc_send_recv(uint8_t* tx, size_t tx_bits, uint8_t* rx, size_t rx_ma
     return (*rx_bits > 0);
 }
 
-static void nfc_send_halt_only(void) {
-    uint8_t halt[4] = {0x50, 0x00, 0x00, 0x00};
-    append_crc(halt, 2);
-    furi_thread_flags_clear(0xFFFFFFFF);
-    furi_hal_nfc_poller_tx(halt, 32);
-    furi_hal_nfc_poller_wait_event(20); 
-}
-
 static void force_hardware_reset(uint32_t ms_charge) {
     furi_hal_nfc_low_power_mode_start(); 
     furi_delay_ms(15);
@@ -77,7 +69,7 @@ static bool nfc_iso14443a_wake_and_select(void) {
 
     uint8_t anticoll[2] = {0x93, 0x20};
     if(!nfc_send_recv(anticoll, 16, rx, sizeof(rx), &rx_bits)) return false;
-    if(rx_bits < 40) return false; // FIX: Controllo di integrità dell'UID ISO14443A rafforzato a 40 bit (come suggerito)
+    if(rx_bits < 40) return false; // Controllo di integrità dell'UID ISO14443A rafforzato a 40 bit
 
     uint8_t select_cmd[9] = {0x93, 0x70, rx[0], rx[1], rx[2], rx[3], rx[4], 0, 0};
     append_crc(select_cmd, 7);
@@ -87,7 +79,7 @@ static bool nfc_iso14443a_wake_and_select(void) {
 }
 
 // =========================================================
-// MOTORI BACKDOOR E SCRITTURA
+// MOTORI BACKDOOR (UFUID Gen2 & FUID Blind Knock)
 // =========================================================
 
 static bool try_gen2_backdoor(void) {
@@ -133,6 +125,9 @@ static bool try_gen1_blind_knock(void) {
     // A questo punto, se era un FUID, la porta è aperta in silenzio.
     return true;
 }
+// =========================================================
+// MOTORE DI SCRITTURA E SIGILLATURA
+// =========================================================
 
 static bool nfc_write_block(uint8_t block_num, uint8_t* data) {
     uint8_t rx[32];
@@ -147,7 +142,7 @@ static bool nfc_write_block(uint8_t block_num, uint8_t* data) {
         return false;
     }
     
-    FURI_LOG_I(TAG, "WRITE ACK BITS=%zu, ACK=%02X", rx_bits, rx[0]); // Sonda Diagnostica
+    FURI_LOG_I(TAG, "WRITE ACK BITS=%zu, ACK=%02X", rx_bits, rx[0]); 
     if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) {
         FURI_LOG_E(TAG, "WRITE BLOCK %d FAILED (0xA0 NAK)", block_num);
         return false;
