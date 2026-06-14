@@ -86,75 +86,14 @@ static bool nfc_iso14443a_wake_and_select(void) {
 }
 
 // =========================================================
-// SEQUENZE BACKDOOR: GEN1 & GEN2
+// SEQUENZE BACKDOOR (GEN2 e fallbacks GEN1)
 // =========================================================
-
-static bool gen1_magic_knock(void) {
-    uint8_t rx[32];
-    size_t  rx_bits = 0;
-    uint8_t c1 = 0x40;
-    
-    furi_thread_flags_clear(0xFFFFFFFF);
-    if(furi_hal_nfc_poller_tx(&c1, 7) != FuriHalNfcErrorNone) return false;
-
-    bool rx_success = false;
-    uint32_t start_time = furi_get_tick();
-    
-    while(furi_get_tick() - start_time < 200) {
-        FuriHalNfcEvent event = furi_hal_nfc_poller_wait_event(20);
-        if(event & FuriHalNfcEventRxEnd) {
-            rx_success = true;
-            break;
-        }
-        if((event & FuriHalNfcEventTimeout) && (furi_get_tick() - start_time > 150)) {
-            break;
-        }
-    }
-    
-    if(!rx_success) return false;
-    
-    furi_hal_nfc_poller_rx(rx, sizeof(rx), &rx_bits);
-    if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
-
-    uint8_t c2 = 0x43;
-    if(!nfc_send_recv(&c2, 8, rx, sizeof(rx), &rx_bits)) return false;
-    if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
-
-    return true;
-}
-
-static bool try_gen1_backdoor(void) {
-    FURI_LOG_I(TAG, "TRY GEN1 COLD");
-    return gen1_magic_knock();
-}
-
-static bool try_gen1_wake_backdoor(void) {
-    FURI_LOG_I(TAG, "TRY GEN1 WAKE");
-    uint8_t rx[32];
-    size_t rx_bits = 0;
-    uint8_t wupa = 0x52;
-    
-    nfc_send_recv(&wupa, 7, rx, sizeof(rx), &rx_bits);
-    furi_delay_ms(5);
-    nfc_send_recv(&wupa, 7, rx, sizeof(rx), &rx_bits);
-    
-    if(!nfc_iso14443a_wake_and_select()) return false;
-    return gen1_magic_knock();
-}
-
-static bool try_gen1_proxmark_backdoor(void) {
-    FURI_LOG_I(TAG, "TRY GEN1 PROXMARK");
-    if(!nfc_iso14443a_wake_and_select()) return false;
-    nfc_send_halt_only();
-    furi_delay_ms(30); 
-    return gen1_magic_knock();
-}
 
 static bool try_gen2_backdoor(void) {
     uint8_t rx[32];
     size_t rx_bits = 0;
 
-    FURI_LOG_I(TAG, "TRY GEN2 PROTOCOL");
+    FURI_LOG_I(TAG, "TRY GEN2 PROTOCOL (0x60)");
     if(!nfc_iso14443a_wake_and_select()) return false;
 
     uint8_t auth_cmd[] = {0x60, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00};
@@ -173,32 +112,96 @@ static bool try_gen2_backdoor(void) {
     return true;
 }
 
+static bool gen1_magic_knock(void) {
+    uint8_t rx[32];
+    size_t  rx_bits = 0;
+    uint8_t c1 = 0x40;
+    
+    furi_thread_flags_clear(0xFFFFFFFF);
+    if(furi_hal_nfc_poller_tx(&c1, 7) != FuriHalNfcErrorNone) return false;
+
+    bool rx_success = false;
+    uint32_t start_time = furi_get_tick();
+    
+    while(furi_get_tick() - start_time < 200) {
+        FuriHalNfcEvent event = furi_hal_nfc_poller_wait_event(20);
+        if(event & FuriHalNfcEventRxEnd) {
+            rx_success = true;
+            break;
+        }
+        if((event & FuriHalNfcEventTimeout) && (furi_get_tick() - start_time > 150)) break;
+    }
+    
+    if(!rx_success) return false;
+    
+    furi_hal_nfc_poller_rx(rx, sizeof(rx), &rx_bits);
+    if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
+
+    uint8_t c2 = 0x43;
+    if(!nfc_send_recv(&c2, 8, rx, sizeof(rx), &rx_bits)) return false;
+    if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
+
+    return true;
+}
+
+static bool try_gen1_backdoor(void) {
+    FURI_LOG_I(TAG, "TRY GEN1 COLD (0x40)");
+    return gen1_magic_knock();
+}
+
+static bool try_gen1_wake_backdoor(void) {
+    FURI_LOG_I(TAG, "TRY GEN1 WAKE");
+    uint8_t rx[32]; size_t rx_bits = 0; uint8_t wupa = 0x52;
+    nfc_send_recv(&wupa, 7, rx, sizeof(rx), &rx_bits);
+    furi_delay_ms(5);
+    nfc_send_recv(&wupa, 7, rx, sizeof(rx), &rx_bits);
+    if(nfc_iso14443a_wake_and_select()) {
+        if(gen1_magic_knock()) return true;
+    }
+    return false;
+}
+
+static bool try_gen1_proxmark_backdoor(void) {
+    FURI_LOG_I(TAG, "TRY GEN1 PROXMARK");
+    if(nfc_iso14443a_wake_and_select()) {
+        nfc_send_halt_only();
+        furi_delay_ms(30); 
+        if(gen1_magic_knock()) return true;
+    }
+    return false;
+}
+
 // =========================================================
-// MOTORI ISOLATI
+// MOTORI ISOLATI (CORRETTI CON GEN2 FIRST)
 // =========================================================
 
 static bool prepare_fuid_tag(void) {
-    // Inclusione della logica Gen2 come prima difesa per i FUID "AA55C396"
+    // 1. Il nostro asso nella manica per i FUID "AA55C396" (Gen2)
     if(try_gen2_backdoor()) return true;
-    
+
+    // Se non è un Gen2 mascherato, proviamo i fallback Gen1 classici
     force_hardware_reset(40);
     if(try_gen1_backdoor()) return true;
-    
+
     force_hardware_reset(40);
     if(try_gen1_wake_backdoor()) return true;
-    
+
     force_hardware_reset(80); 
     if(try_gen1_proxmark_backdoor()) return true;
-    
+
     return false;
 }
 
 static bool prepare_ufuid_tag(void) {
-    if(try_gen1_backdoor()) return true; 
+    if(try_gen2_backdoor()) return true; 
+    
+    // Fallback per UFUID strani
     force_hardware_reset(40);
-    if(try_gen2_backdoor()) return true;
+    if(try_gen1_backdoor()) return true;
+    
     force_hardware_reset(80);
     if(try_gen1_proxmark_backdoor()) return true;
+    
     return false;
 }
 // =========================================================
@@ -321,10 +324,6 @@ static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
             tag_ready = prepare_fuid_tag();
         } else {
             tag_ready = prepare_ufuid_tag();
-            if(!tag_ready) {
-                force_hardware_reset(40);
-                continue;
-            }
         }
 
         if(tag_ready) {
@@ -371,7 +370,7 @@ static void draw_callback(Canvas* canvas, void* ctx) {
     canvas_set_font(canvas, FontPrimary);
 
     if(context->state == AppMenu) {
-        canvas_draw_str_aligned(canvas, 64, 5, AlignCenter, AlignTop, "UFUID Sealer v15.0");
+        canvas_draw_str_aligned(canvas, 64, 5, AlignCenter, AlignTop, "UFUID Sealer v16.0");
         canvas_set_font(canvas, FontSecondary);
         for(uint8_t i = 0; i < 3; i++) {
             if(i == context->menu_index) {
@@ -453,7 +452,6 @@ int32_t ufuid_sealer_app(void* p) {
 
                         if(go_ahead) {
                             furi_delay_ms(200);
-                            
                             furi_message_queue_reset(context->event_queue);
                             
                             context->state = AppProcessing;
