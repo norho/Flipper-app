@@ -69,7 +69,7 @@ static bool nfc_iso14443a_wake_and_select(void) {
 
     uint8_t anticoll[2] = {0x93, 0x20};
     if(!nfc_send_recv(anticoll, 16, rx, sizeof(rx), &rx_bits)) return false;
-    if(rx_bits < 40) return false; // Controllo di integrità dell'UID ISO14443A rafforzato a 40 bit
+    if(rx_bits < 40) return false; // Controllo di integrità dell'UID a 40 bit
 
     uint8_t select_cmd[9] = {0x93, 0x70, rx[0], rx[1], rx[2], rx[3], rx[4], 0, 0};
     append_crc(select_cmd, 7);
@@ -105,24 +105,26 @@ static bool try_gen2_backdoor(void) {
     return true;
 }
 
-// L'ATTACCO CIECO PER I FUID MUTI
+// FIX: ATTACCO CIECO PULITO (Consumo degli eventi HAL fantasma)
 static bool try_gen1_blind_knock(void) {
-    FURI_LOG_I(TAG, "Sblocco Gen1 BLIND (FUID)");
+    FURI_LOG_I(TAG, "Sblocco Gen1 BLIND PULITO (FUID)");
     
     uint8_t c1 = 0x40;
     furi_thread_flags_clear(0xFFFFFFFF);
     if(furi_hal_nfc_poller_tx(&c1, 7) != FuriHalNfcErrorNone) return false;
     
-    // Non controlliamo MAI la risposta. I FUID AA55C396 non mandano l'ACK a 0x40.
-    furi_delay_ms(15); 
+    // Pulizia hardware 1: Aspettiamo l'evento (anche se è un timeout o un framing error)
+    // per sbloccare il registro radio, ma NON valutiamo l'esito.
+    furi_hal_nfc_poller_wait_event(30); 
 
     uint8_t c2 = 0x43;
     furi_thread_flags_clear(0xFFFFFFFF);
     if(furi_hal_nfc_poller_tx(&c2, 8) != FuriHalNfcErrorNone) return false;
     
-    furi_delay_ms(15); 
+    // Pulizia hardware 2
+    furi_hal_nfc_poller_wait_event(30); 
     
-    // A questo punto, se era un FUID, la porta è aperta in silenzio.
+    // Se la porta si è aperta in silenzio, ora la radio è pulita per la scrittura.
     return true;
 }
 // =========================================================
@@ -244,13 +246,13 @@ static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
         bool tag_ready = false;
         
         if (action_index == 0) { // FUID Mode
-            // Facciamo i sordi e forziamo le chiavi senza aspettare conferme.
+            // Usiamo il Blind Knock Pulito per sbloccare la porta di servizio se esiste.
             tag_ready = try_gen1_blind_knock();
         } else { // UFUID Mode
             tag_ready = try_gen2_backdoor();
             if(!tag_ready) {
                 force_hardware_reset(40);
-                continue; // L'UFUID deve farsi riconoscere
+                continue; 
             }
         }
 
