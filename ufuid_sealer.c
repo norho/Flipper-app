@@ -183,7 +183,6 @@ static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
         }
         furi_delay_ms(50);
         
-        // Reset HW in caso di failure dello sblocco
         furi_hal_nfc_low_power_mode_start(); 
         furi_delay_ms(15);
         furi_hal_nfc_low_power_mode_stop();  
@@ -200,7 +199,7 @@ static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
 }
 
 // =========================================================
-// COMPILATORE JIT BIN -> NFC (PER FUID BLINDATI)
+// COMPILATORE JIT BIN -> NFC (FIX SICUREZZA FURIOS)
 // =========================================================
 
 static bool compile_bin_to_nfc(const char* bin_path) {
@@ -214,10 +213,13 @@ static bool compile_bin_to_nfc(const char* bin_path) {
         if(storage_file_read(file_in, dump, 1024) == 1024) {
             
             char out_path[256];
-            strncpy(out_path, bin_path, sizeof(out_path) - 1);
+            // Utilizzo di strlcpy e strlcat (API Sicure approvate dal firmware Flipper)
+            strlcpy(out_path, bin_path, sizeof(out_path));
             char* ext = strstr(out_path, ".bin");
-            if(ext) strcpy(ext, ".nfc");
-            else strcat(out_path, ".nfc");
+            if(ext) {
+                *ext = '\0'; // Trunca la stringa rimuovendo l'estensione .bin
+            }
+            strlcat(out_path, ".nfc", sizeof(out_path)); // Aggiunge l'estensione .nfc in sicurezza
 
             if(storage_file_open(file_out, out_path, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
                 char header[256];
