@@ -50,6 +50,7 @@ static bool nfc_send_recv(uint8_t* tx, size_t tx_bits, uint8_t* rx, size_t rx_ma
     return (*rx_bits > 0);
 }
 
+// CRITICAL FIX: Aggressive Hardware Reset to prevent radio lockups
 static void force_hardware_reset(void) {
     furi_hal_nfc_low_power_mode_start(); 
     furi_delay_ms(15);
@@ -59,7 +60,6 @@ static void force_hardware_reset(void) {
     furi_delay_ms(40); 
 }
 
-// FIX: WAKE UP RILASSATO (Per chip magici cinesi imprecisi)
 static bool nfc_iso14443a_wake_relaxed(void) {
     uint8_t rx[32];
     size_t rx_bits = 0;
@@ -69,7 +69,6 @@ static bool nfc_iso14443a_wake_relaxed(void) {
 
     uint8_t anticoll[2] = {0x93, 0x20};
     if(!nfc_send_recv(anticoll, 16, rx, sizeof(rx), &rx_bits)) return false;
-    // Rimosso il blocco a 40 bit. Accettiamo risposte parziali (>= 32 bit).
     if(rx_bits < 32) return false; 
 
     uint8_t select_cmd[9] = {0x93, 0x70, rx[0], rx[1], rx[2], rx[3], rx[4], 0, 0};
@@ -80,10 +79,9 @@ static bool nfc_iso14443a_wake_relaxed(void) {
 }
 
 // =========================================================
-// MOTORI DI SCRITTURA (RAW MAGIC VS CRYPTO STANDARD)
+// MOTORE BACKDOOR GEN2 (UFUID)
 // =========================================================
 
-// 1. Motore MAGIC RAW (Esclusivo per UFUID)
 static bool try_gen2_backdoor(void) {
     uint8_t rx[32];
     size_t rx_bits = 0;
@@ -124,7 +122,7 @@ static bool nfc_write_block_raw(uint8_t block_num, uint8_t* data) {
     return (rx_bits >= 4 && (rx[0] & 0x0F) == 0x0A);
 }
 // =========================================================
-// MOTORE JIT COMPILER (Esclusivo per FUID)
+// MOTORE JIT COMPILER (FUID)
 // =========================================================
 
 static bool compile_bin_to_nfc(const char* bin_path) {
@@ -257,8 +255,10 @@ static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
             else if(action_index == 2) result = seal_ufuid();
             break; 
         }
-        furi_delay_ms(50);
+        
+        // CRITICAL FIX: Restore Hardware Reset on failure to prevent radio lockup
         force_hardware_reset();
+        furi_delay_ms(50);
     }
 
     furi_hal_nfc_low_power_mode_start();
