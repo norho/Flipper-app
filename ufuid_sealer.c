@@ -50,7 +50,17 @@ static bool nfc_send_recv(uint8_t* tx, size_t tx_bits, uint8_t* rx, size_t rx_ma
     return (*rx_bits > 0);
 }
 
-static bool nfc_iso14443a_wake_and_select(void) {
+static void force_hardware_reset(void) {
+    furi_hal_nfc_low_power_mode_start(); 
+    furi_delay_ms(15);
+    furi_hal_nfc_low_power_mode_stop();  
+    furi_hal_nfc_set_mode(FuriHalNfcModePoller, FuriHalNfcTechIso14443a);
+    furi_hal_nfc_poller_field_on(); 
+    furi_delay_ms(40); 
+}
+
+// FIX: WAKE UP RILASSATO (Per chip magici cinesi imprecisi)
+static bool nfc_iso14443a_wake_relaxed(void) {
     uint8_t rx[32];
     size_t rx_bits = 0;
 
@@ -59,6 +69,7 @@ static bool nfc_iso14443a_wake_and_select(void) {
 
     uint8_t anticoll[2] = {0x93, 0x20};
     if(!nfc_send_recv(anticoll, 16, rx, sizeof(rx), &rx_bits)) return false;
+    // Rimosso il blocco a 40 bit. Accettiamo risposte parziali (>= 32 bit).
     if(rx_bits < 32) return false; 
 
     uint8_t select_cmd[9] = {0x93, 0x70, rx[0], rx[1], rx[2], rx[3], rx[4], 0, 0};
@@ -69,15 +80,16 @@ static bool nfc_iso14443a_wake_and_select(void) {
 }
 
 // =========================================================
-// MOTORE BACKDOOR GEN2 (ESCLUSIVO PER UFUID)
+// MOTORI DI SCRITTURA (RAW MAGIC VS CRYPTO STANDARD)
 // =========================================================
 
-static bool prepare_ufuid_tag(void) {
+// 1. Motore MAGIC RAW (Esclusivo per UFUID)
+static bool try_gen2_backdoor(void) {
     uint8_t rx[32];
     size_t rx_bits = 0;
-
-    FURI_LOG_I(TAG, "Sblocco Backdoor Gen2 (UFUID)");
-    if(!nfc_iso14443a_wake_and_select()) return false;
+    
+    FURI_LOG_I(TAG, "Sblocco Backdoor Gen2 UFUID");
+    if(!nfc_iso14443a_wake_relaxed()) return false;
 
     uint8_t auth_cmd[] = {0x60, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00};
     append_crc(auth_cmd, 8);
@@ -94,11 +106,8 @@ static bool prepare_ufuid_tag(void) {
 
     return true;
 }
-// =========================================================
-// MOTORE DI SCRITTURA E SIGILLATURA (UFUID)
-// =========================================================
 
-static bool nfc_write_block(uint8_t block_num, uint8_t* data) {
+static bool nfc_write_block_raw(uint8_t block_num, uint8_t* data) {
     uint8_t rx[32];
     size_t  rx_bits = 0;
 
@@ -114,92 +123,8 @@ static bool nfc_write_block(uint8_t block_num, uint8_t* data) {
     
     return (rx_bits >= 4 && (rx[0] & 0x0F) == 0x0A);
 }
-
-static bool core_write_mifare_bin(const char* file_path) {
-    Storage* storage = furi_record_open(RECORD_STORAGE);
-    File* file       = storage_file_alloc(storage);
-    uint8_t* dump = malloc(1024);
-    
-    if(!dump || !storage_file_open(file, file_path, FSAM_READ, FSOM_OPEN_EXISTING)) {
-        if(dump) free(dump);
-        storage_file_free(file);
-        furi_record_close(RECORD_STORAGE);
-        return false;
-    }
-    
-    bool ok = (storage_file_read(file, dump, 1024) == 1024);
-    storage_file_close(file);
-    storage_file_free(file);
-    furi_record_close(RECORD_STORAGE);
-
-    if(!ok) { free(dump); return false; }
-
-    bool success = true;
-    for(uint8_t i = 1; i < 64; i++) {
-        if(!nfc_write_block(i, &dump[i * 16])) { success = false; break; }
-        furi_delay_ms(5); 
-    }
-    if(success) {
-        if(!nfc_write_block(0, &dump[0])) success = false;
-    }
-
-    free(dump);
-    return success;
-}
-
-static bool seal_ufuid(void) {
-    uint8_t rx[32]; size_t rx_bits = 0;
-    uint8_t c3[4] = {0xE1, 0x00, 0, 0};
-    append_crc(c3, 2);
-    if(!nfc_send_recv(c3, 32, rx, sizeof(rx), &rx_bits)) return false;
-    if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
-
-    uint8_t seal[18] = {
-        0x85, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00};
-    append_crc(seal, 16);
-    if(!nfc_send_recv(seal, 144, rx, sizeof(rx), &rx_bits)) return false;
-
-    return (rx_bits >= 4 && (rx[0] & 0x0F) == 0x0A);
-}
-
-static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
-    bool result = false;
-    NotificationApp* notifications = furi_record_open(RECORD_NOTIFICATION);
-    notification_message(notifications, &sequence_blink_start_cyan);
-
-    furi_hal_nfc_acquire();
-    furi_hal_nfc_low_power_mode_stop();
-    furi_hal_nfc_set_mode(FuriHalNfcModePoller, FuriHalNfcTechIso14443a);
-    furi_hal_nfc_poller_field_on();
-    furi_delay_ms(80);
-
-    uint32_t start_time = furi_get_tick();
-    while(furi_get_tick() - start_time < 5000) {
-        if(prepare_ufuid_tag()) {
-            if(action_index == 0) result = core_write_mifare_bin(file_path);
-            else if(action_index == 1) result = seal_ufuid();
-            break; 
-        }
-        furi_delay_ms(50);
-        
-        furi_hal_nfc_low_power_mode_start(); 
-        furi_delay_ms(15);
-        furi_hal_nfc_low_power_mode_stop();  
-        furi_hal_nfc_set_mode(FuriHalNfcModePoller, FuriHalNfcTechIso14443a);
-        furi_hal_nfc_poller_field_on(); 
-        furi_delay_ms(40);
-    }
-
-    furi_hal_nfc_low_power_mode_start();
-    furi_hal_nfc_release();
-    notification_message(notifications, result ? &sequence_success : &sequence_error);
-    furi_record_close(RECORD_NOTIFICATION);
-    return result;
-}
-
 // =========================================================
-// COMPILATORE JIT BIN -> NFC (FIX SICUREZZA FURIOS)
+// MOTORE JIT COMPILER (Esclusivo per FUID)
 // =========================================================
 
 static bool compile_bin_to_nfc(const char* bin_path) {
@@ -213,13 +138,12 @@ static bool compile_bin_to_nfc(const char* bin_path) {
         if(storage_file_read(file_in, dump, 1024) == 1024) {
             
             char out_path[256];
-            // Utilizzo di strlcpy e strlcat (API Sicure approvate dal firmware Flipper)
             strlcpy(out_path, bin_path, sizeof(out_path));
             char* ext = strstr(out_path, ".bin");
             if(ext) {
-                *ext = '\0'; // Trunca la stringa rimuovendo l'estensione .bin
+                *ext = '\0'; 
             }
-            strlcat(out_path, ".nfc", sizeof(out_path)); // Aggiunge l'estensione .nfc in sicurezza
+            strlcat(out_path, ".nfc", sizeof(out_path));
 
             if(storage_file_open(file_out, out_path, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
                 char header[256];
@@ -260,6 +184,88 @@ static bool compile_bin_to_nfc(const char* bin_path) {
     furi_record_close(RECORD_STORAGE);
     free(dump);
     return success;
+}
+
+// =========================================================
+// ROUTER ESECUZIONE NFC E SIGILLATURA (UFUID)
+// =========================================================
+
+static bool core_write_mifare_bin(const char* file_path) {
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    File* file       = storage_file_alloc(storage);
+    uint8_t* dump = malloc(1024);
+    
+    if(!dump || !storage_file_open(file, file_path, FSAM_READ, FSOM_OPEN_EXISTING)) {
+        if(dump) free(dump);
+        storage_file_free(file);
+        furi_record_close(RECORD_STORAGE);
+        return false;
+    }
+    
+    bool ok = (storage_file_read(file, dump, 1024) == 1024);
+    storage_file_close(file);
+    storage_file_free(file);
+    furi_record_close(RECORD_STORAGE);
+
+    if(!ok) { free(dump); return false; }
+
+    bool success = true;
+    for(uint8_t i = 1; i < 64; i++) {
+        if(!nfc_write_block_raw(i, &dump[i * 16])) { success = false; break; }
+        furi_delay_ms(5); 
+    }
+    if(success) {
+        if(!nfc_write_block_raw(0, &dump[0])) success = false;
+    }
+
+    free(dump);
+    return success;
+}
+
+static bool seal_ufuid(void) {
+    uint8_t rx[32]; size_t rx_bits = 0;
+    
+    uint8_t c3[4] = {0xE1, 0x00, 0, 0};
+    append_crc(c3, 2);
+    if(!nfc_send_recv(c3, 32, rx, sizeof(rx), &rx_bits)) return false;
+    if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
+
+    uint8_t seal[18] = {
+        0x85, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00};
+    append_crc(seal, 16);
+    if(!nfc_send_recv(seal, 144, rx, sizeof(rx), &rx_bits)) return false;
+
+    return (rx_bits >= 4 && (rx[0] & 0x0F) == 0x0A);
+}
+
+static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
+    bool result = false;
+    NotificationApp* notifications = furi_record_open(RECORD_NOTIFICATION);
+    notification_message(notifications, &sequence_blink_start_cyan);
+
+    furi_hal_nfc_acquire();
+    furi_hal_nfc_low_power_mode_stop();
+    furi_hal_nfc_set_mode(FuriHalNfcModePoller, FuriHalNfcTechIso14443a);
+    furi_hal_nfc_poller_field_on();
+    furi_delay_ms(80);
+
+    uint32_t start_time = furi_get_tick();
+    while(furi_get_tick() - start_time < 5000) {
+        if(try_gen2_backdoor()) {
+            if(action_index == 1) result = core_write_mifare_bin(file_path);
+            else if(action_index == 2) result = seal_ufuid();
+            break; 
+        }
+        furi_delay_ms(50);
+        force_hardware_reset();
+    }
+
+    furi_hal_nfc_low_power_mode_start();
+    furi_hal_nfc_release();
+    notification_message(notifications, result ? &sequence_success : &sequence_error);
+    furi_record_close(RECORD_NOTIFICATION);
+    return result;
 }
 
 // =========================================================
@@ -327,9 +333,9 @@ int32_t ufuid_sealer_app(void* p) {
     AppContext* context    = malloc(sizeof(AppContext));
     context->state         = AppMenu;
     context->menu_index    = 0;
-    context->menu_items[0] = "1. Scrivi tag UFUID (Gen2)";
-    context->menu_items[1] = "2. Sigilla tag UFUID";
-    context->menu_items[2] = "3. Prepara FUID (.bin > .nfc)";
+    context->menu_items[0] = "1. Prepara FUID (.bin > .nfc)";
+    context->menu_items[1] = "2. Scrivi tag UFUID";
+    context->menu_items[2] = "3. Sigilla tag UFUID";
     context->event_queue   = furi_message_queue_alloc(8, sizeof(InputEvent));
 
     ViewPort* view_port = view_port_alloc();
@@ -370,7 +376,7 @@ int32_t ufuid_sealer_app(void* p) {
                             furi_delay_ms(200);
                             furi_message_queue_reset(context->event_queue);
                             
-                            if (context->menu_index == 2) {
+                            if (context->menu_index == 0) {
                                 bool success = compile_bin_to_nfc(furi_string_get_cstr(file_path));
                                 context->state = success ? AppCompiled : AppError;
                                 view_port_update(view_port);
