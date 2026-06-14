@@ -86,31 +86,8 @@ static bool nfc_iso14443a_wake_and_select(void) {
 }
 
 // =========================================================
-// SEQUENZE BACKDOOR (GEN2 e fallbacks GEN1)
+// SEQUENZE BACKDOOR (GEN1, GEN2 & DIRECT)
 // =========================================================
-
-static bool try_gen2_backdoor(void) {
-    uint8_t rx[32];
-    size_t rx_bits = 0;
-
-    FURI_LOG_I(TAG, "TRY GEN2 PROTOCOL (0x60)");
-    if(!nfc_iso14443a_wake_and_select()) return false;
-
-    uint8_t auth_cmd[] = {0x60, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00};
-    append_crc(auth_cmd, 8);
-    if(!nfc_send_recv(auth_cmd, 80, rx, sizeof(rx), &rx_bits)) return false;
-    if(rx_bits < 32) return false; 
-
-    uint8_t c1 = 0x40;
-    if(!nfc_send_recv(&c1, 7, rx, sizeof(rx), &rx_bits)) return false;
-    if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
-
-    uint8_t c2 = 0x43;
-    if(!nfc_send_recv(&c2, 8, rx, sizeof(rx), &rx_bits)) return false;
-    if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
-
-    return true;
-}
 
 static bool gen1_magic_knock(void) {
     uint8_t rx[32];
@@ -129,7 +106,9 @@ static bool gen1_magic_knock(void) {
             rx_success = true;
             break;
         }
-        if((event & FuriHalNfcEventTimeout) && (furi_get_tick() - start_time > 150)) break;
+        if((event & FuriHalNfcEventTimeout) && (furi_get_tick() - start_time > 150)) {
+            break;
+        }
     }
     
     if(!rx_success) return false;
@@ -155,53 +134,71 @@ static bool try_gen1_wake_backdoor(void) {
     nfc_send_recv(&wupa, 7, rx, sizeof(rx), &rx_bits);
     furi_delay_ms(5);
     nfc_send_recv(&wupa, 7, rx, sizeof(rx), &rx_bits);
-    if(nfc_iso14443a_wake_and_select()) {
-        if(gen1_magic_knock()) return true;
-    }
-    return false;
+    if(!nfc_iso14443a_wake_and_select()) return false;
+    return gen1_magic_knock();
 }
 
 static bool try_gen1_proxmark_backdoor(void) {
     FURI_LOG_I(TAG, "TRY GEN1 PROXMARK");
-    if(nfc_iso14443a_wake_and_select()) {
-        nfc_send_halt_only();
-        furi_delay_ms(30); 
-        if(gen1_magic_knock()) return true;
-    }
-    return false;
+    if(!nfc_iso14443a_wake_and_select()) return false;
+    nfc_send_halt_only();
+    furi_delay_ms(30); 
+    return gen1_magic_knock();
+}
+
+static bool try_gen2_backdoor(void) {
+    uint8_t rx[32];
+    size_t rx_bits = 0;
+
+    FURI_LOG_I(TAG, "TRY GEN2 PROTOCOL (0x60)");
+    if(!nfc_iso14443a_wake_and_select()) return false;
+
+    uint8_t auth_cmd[] = {0x60, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00};
+    append_crc(auth_cmd, 8);
+    if(!nfc_send_recv(auth_cmd, 80, rx, sizeof(rx), &rx_bits)) return false;
+    if(rx_bits < 32) return false; 
+
+    uint8_t c1 = 0x40;
+    if(!nfc_send_recv(&c1, 7, rx, sizeof(rx), &rx_bits)) return false;
+    if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
+
+    uint8_t c2 = 0x43;
+    if(!nfc_send_recv(&c2, 8, rx, sizeof(rx), &rx_bits)) return false;
+    if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
+
+    return true;
+}
+
+// FIX: La "porta aperta". Nessuna backdoor, solo sveglia il tag e attaccalo.
+static bool try_direct_write(void) {
+    FURI_LOG_I(TAG, "TRY DIRECT WRITE (NO BACKDOOR)");
+    return nfc_iso14443a_wake_and_select();
 }
 
 // =========================================================
-// MOTORI ISOLATI (CORRETTI CON GEN2 FIRST)
+// MOTORI ISOLATI
 // =========================================================
 
 static bool prepare_fuid_tag(void) {
-    // 1. Il nostro asso nella manica per i FUID "AA55C396" (Gen2)
     if(try_gen2_backdoor()) return true;
-
-    // Se non è un Gen2 mascherato, proviamo i fallback Gen1 classici
     force_hardware_reset(40);
     if(try_gen1_backdoor()) return true;
-
     force_hardware_reset(40);
     if(try_gen1_wake_backdoor()) return true;
-
     force_hardware_reset(80); 
     if(try_gen1_proxmark_backdoor()) return true;
-
+    force_hardware_reset(40);
+    if(try_direct_write()) return true; // Asso nella manica per i FUID "Porta Aperta"
+    
     return false;
 }
 
 static bool prepare_ufuid_tag(void) {
     if(try_gen2_backdoor()) return true; 
-    
-    // Fallback per UFUID strani
     force_hardware_reset(40);
     if(try_gen1_backdoor()) return true;
-    
     force_hardware_reset(80);
     if(try_gen1_proxmark_backdoor()) return true;
-    
     return false;
 }
 // =========================================================
@@ -215,7 +212,7 @@ static bool nfc_write_block(uint8_t block_num, uint8_t* data) {
     uint8_t cmd[4] = {0xA0, block_num, 0, 0};
     append_crc(cmd, 2);
     if(!nfc_send_recv(cmd, 32, rx, sizeof(rx), &rx_bits)) {
-        FURI_LOG_E(TAG, "Write B%d 0xA0 TMO", block_num);
+        FURI_LOG_E(TAG, "Write B%d 0xA0 TMO/ERR", block_num);
         return false;
     }
     if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) {
@@ -227,7 +224,7 @@ static bool nfc_write_block(uint8_t block_num, uint8_t* data) {
     memcpy(write_data, data, 16);
     append_crc(write_data, 16);
     if(!nfc_send_recv(write_data, 144, rx, sizeof(rx), &rx_bits)) {
-        FURI_LOG_E(TAG, "Write B%d DATA TMO", block_num);
+        FURI_LOG_E(TAG, "Write B%d DATA TMO/ERR", block_num);
         return false;
     }
     if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) {
