@@ -35,12 +35,10 @@ static bool nfc_send_recv(uint8_t* tx, size_t tx_bits, uint8_t* rx, size_t rx_ma
 
     while(furi_get_tick() - start_time < 150) {
         FuriHalNfcEvent event = furi_hal_nfc_poller_wait_event(20);
-
         if(event & FuriHalNfcEventRxEnd) {
             rx_success = true;
             break;
         }
-        // Timeout puro
         if((event & FuriHalNfcEventTimeout) && !(event & FuriHalNfcEventRxEnd)) {
             break;
         }
@@ -87,7 +85,7 @@ static bool nfc_iso14443a_wake_and_select(void) {
 }
 
 // =========================================================
-// BACKDOOR GEN1 E GEN2 (FUID / UFUID)
+// BACKDOOR GEN1 E GEN2 (UFUID)
 // =========================================================
 
 static bool try_gen1_backdoor(void) {
@@ -96,7 +94,6 @@ static bool try_gen1_backdoor(void) {
 
     FURI_LOG_I(TAG, "TRY BACKDOOR GEN1");
     uint8_t c1 = 0x40;
-
     if(!nfc_send_recv(&c1, 7, rx, sizeof(rx), &rx_bits)) return false;
     if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
 
@@ -116,7 +113,6 @@ static bool try_gen2_backdoor(void) {
 
     uint8_t auth_cmd[] = {0x60, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00};
     append_crc(auth_cmd, 8);
-
     if(!nfc_send_recv(auth_cmd, 80, rx, sizeof(rx), &rx_bits)) return false;
     if(rx_bits < 32) return false;
 
@@ -131,7 +127,7 @@ static bool try_gen2_backdoor(void) {
     return true;
 }
 
-// Motore robusto con Gen1 + Gen2 + fallback (dal codice 1)
+// Motore robusto: Gen1 -> Gen2 -> fallback halt+reset+Gen1
 static bool prepare_magic_tag(void) {
     if(try_gen1_backdoor()) return true;
 
@@ -148,7 +144,7 @@ static bool prepare_magic_tag(void) {
 }
 
 // =========================================================
-// MOTORE DI SCRITTURA E SIGILLATURA CON LOG CAPILLARI
+// MOTORE DI SCRITTURA E SIGILLATURA UFUID
 // =========================================================
 
 static bool nfc_write_block(uint8_t block_num, uint8_t* data) {
@@ -205,7 +201,7 @@ static bool core_write_mifare_bin(const char* file_path) {
     }
 
     bool success = true;
-    // Scrittura standard blocchi 1-63
+    // Blocchi 1-63 prima, blocco 0 per ultimo (regola cinese)
     for(uint8_t i = 1; i < 64; i++) {
         if(!nfc_write_block(i, &dump[i * 16])) {
             success = false;
@@ -213,7 +209,6 @@ static bool core_write_mifare_bin(const char* file_path) {
         }
         furi_delay_ms(5);
     }
-    // Blocco 0 per ultimo (regola cinese)
     if(success) {
         if(!nfc_write_block(0, &dump[0])) success = false;
     }
@@ -242,10 +237,10 @@ static bool seal_ufuid(void) {
 }
 
 // =========================================================
-// ESECUZIONE NFC PRINCIPALE (SINGLE THREAD SICURO)
+// ESECUZIONE NFC - solo per UFUID
+// action_index: 0=Scrivi UFUID  1=Sigilla UFUID
 // =========================================================
 
-// action_index: 0=Scrivi FUID, 1=Scrivi UFUID, 2=Sigilla UFUID
 static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
     bool result = false;
 
@@ -262,10 +257,9 @@ static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
 
     while(furi_get_tick() - start_time < 5000) {
         if(prepare_magic_tag()) {
-            if(action_index == 0 || action_index == 1) {
-                // FUID e UFUID usano entrambi lo stesso motore di scrittura .bin
+            if(action_index == 0) {
                 result = core_write_mifare_bin(file_path);
-            } else if(action_index == 2) {
+            } else if(action_index == 1) {
                 result = seal_ufuid();
             }
             break;
@@ -277,26 +271,21 @@ static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
     furi_hal_nfc_release();
 
     notification_message(notifications, &sequence_blink_stop);
-    if(result) {
-        notification_message(notifications, &sequence_success);
-    } else {
-        notification_message(notifications, &sequence_error);
-    }
+    notification_message(notifications, result ? &sequence_success : &sequence_error);
     furi_record_close(RECORD_NOTIFICATION);
 
     return result;
 }
 
 // =========================================================
-// MOTORE CONVERTITORE BIN -> NFC (PER I FUID)
-// Legge il .bin, genera un .nfc con chiavi Bambu Lab,
-// compatibile con l'app NFC nativa del Flipper.
+// CONVERTITORE BIN -> NFC (per FUID)
+// Il FUID non accetta scrittura diretta: va convertito in
+// .nfc e scritto tramite l'app NFC nativa del Flipper.
 // =========================================================
 
-// Chiavi Bambu Lab per settori Mifare Classic 1K
-// Key A e Key B estratte dai dump ufficiali Bambu
+// Chiavi Bambu Lab - sostituire con quelle reali del dump
 static const uint8_t bambu_key_a[16][6] = {
-    {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}, // settore 0  - default
+    {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}, // settore 0
     {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}, // settore 1
     {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}, // settore 2
     {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}, // settore 3
@@ -315,7 +304,7 @@ static const uint8_t bambu_key_a[16][6] = {
 };
 
 static const uint8_t bambu_key_b[16][6] = {
-    {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}, // settore 0  - default
+    {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}, // settore 0
     {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}, // settore 1
     {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}, // settore 2
     {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}, // settore 3
@@ -333,11 +322,39 @@ static const uint8_t bambu_key_b[16][6] = {
     {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}, // settore 15
 };
 
+// Copia il path sostituendo .bin con .nfc, senza strcat/strcpy
+static void build_nfc_path(const char* bin_path, char* out_path, size_t out_size) {
+    size_t len = 0;
+    while(len < out_size - 1 && bin_path[len] != '\0') {
+        out_path[len] = bin_path[len];
+        len++;
+    }
+    out_path[len] = '\0';
+
+    if(len >= 4 &&
+       out_path[len-4] == '.' &&
+       out_path[len-3] == 'b' &&
+       out_path[len-2] == 'i' &&
+       out_path[len-1] == 'n') {
+        out_path[len-3] = 'n';
+        out_path[len-2] = 'f';
+        out_path[len-1] = 'c';
+    } else {
+        if(len + 4 < out_size) {
+            out_path[len]   = '.';
+            out_path[len+1] = 'n';
+            out_path[len+2] = 'f';
+            out_path[len+3] = 'c';
+            out_path[len+4] = '\0';
+        }
+    }
+}
+
 static bool convert_bin_to_nfc(const char* bin_path) {
-    Storage* storage  = furi_record_open(RECORD_STORAGE);
-    File* file_in     = storage_file_alloc(storage);
-    File* file_out    = storage_file_alloc(storage);
-    bool success      = false;
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    File* file_in    = storage_file_alloc(storage);
+    File* file_out   = storage_file_alloc(storage);
+    bool success     = false;
 
     uint8_t* dump = malloc(1024);
     if(!dump) {
@@ -351,41 +368,25 @@ static bool convert_bin_to_nfc(const char* bin_path) {
         FURI_LOG_E(TAG, "Impossibile aprire il file .bin");
         goto cleanup;
     }
-
     if(storage_file_read(file_in, dump, 1024) != 1024) {
-        FURI_LOG_E(TAG, "File .bin non valido (dimensione != 1024 bytes)");
+        FURI_LOG_E(TAG, "File .bin non valido (size != 1024)");
         goto cleanup;
     }
     storage_file_close(file_in);
 
-    // Costruisce il path di output sostituendo .bin con .nfc
     char out_path[256];
-    strncpy(out_path, bin_path, sizeof(out_path) - 1);
-    out_path[sizeof(out_path) - 1] = '\0';
-    char* ext = strstr(out_path, ".bin");
-    if(ext) {
-        strcpy(ext, ".nfc");
-    } else {
-        size_t len = strlen(out_path);
-        if(len < sizeof(out_path) - 5) strcat(out_path, ".nfc");
-    }
-
-    FURI_LOG_I(TAG, "Output NFC: %s", out_path);
+    build_nfc_path(bin_path, out_path, sizeof(out_path));
+    FURI_LOG_I(TAG, "Output: %s", out_path);
 
     if(!storage_file_open(file_out, out_path, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
-        FURI_LOG_E(TAG, "Impossibile creare il file .nfc");
+        FURI_LOG_E(TAG, "Impossibile creare .nfc");
         goto cleanup;
     }
 
-    // -------------------------------------------------------
-    // HEADER FLIPPER NFC v4 - Mifare Classic 1K
-    // UID estratto dai byte 0-3 del blocco 0 del dump
-    // ATQA e SAK sono i valori standard Mifare Classic 1K
-    // -------------------------------------------------------
+    // Header Flipper NFC v4 - Mifare Classic 1K
     char header[512];
     int header_len = snprintf(
-        header,
-        sizeof(header),
+        header, sizeof(header),
         "Filetype: Flipper NFC device\n"
         "Version: 4\n"
         "Device type: Mifare Classic\n"
@@ -402,49 +403,32 @@ static bool convert_bin_to_nfc(const char* bin_path) {
         goto cleanup;
     }
 
-    // -------------------------------------------------------
-    // BLOCCHI DATI
-    // Per ogni settore (0-15), i blocchi dati vengono scritti
-    // dal dump. I trailer di settore (blocchi 3,7,11,...,63)
-    // vengono ricostruiti con le chiavi Bambu Lab corrette,
-    // preservando i bit di accesso dal dump originale.
-    // -------------------------------------------------------
+    // 64 blocchi: trailer ricostruiti con chiavi Bambu, dati raw dal dump
     for(int block = 0; block < 64; block++) {
         char block_line[128];
-        uint8_t* b = &dump[block * 16];
-        int sector = block / 4;
+        uint8_t* b      = &dump[block * 16];
+        int sector      = block / 4;
         bool is_trailer = ((block % 4) == 3);
+        int line_len;
 
         if(is_trailer) {
-            // Ricostruisce il trailer con le chiavi Bambu Lab
-            // Struttura trailer: [Key A 6 byte][Access bits 4 byte][Key B 6 byte]
-            // I bit di accesso vengono preservati dal dump originale
-            int trailer_len = snprintf(
-                block_line,
-                sizeof(block_line),
-                "Block %d: %02X %02X %02X %02X %02X %02X "  // Key A
-                "%02X %02X %02X %02X "                        // Access bits (dal dump)
-                "%02X %02X %02X %02X %02X %02X\n",           // Key B
+            // [KeyA 6B][AccessBits dal dump 4B][KeyB 6B]
+            line_len = snprintf(
+                block_line, sizeof(block_line),
+                "Block %d: %02X %02X %02X %02X %02X %02X "
+                "%02X %02X %02X %02X "
+                "%02X %02X %02X %02X %02X %02X\n",
                 block,
-                // Key A Bambu
                 bambu_key_a[sector][0], bambu_key_a[sector][1],
                 bambu_key_a[sector][2], bambu_key_a[sector][3],
                 bambu_key_a[sector][4], bambu_key_a[sector][5],
-                // Access bits dal dump originale (byte 6-9 del trailer)
                 b[6], b[7], b[8], b[9],
-                // Key B Bambu
                 bambu_key_b[sector][0], bambu_key_b[sector][1],
                 bambu_key_b[sector][2], bambu_key_b[sector][3],
                 bambu_key_b[sector][4], bambu_key_b[sector][5]);
-            if(storage_file_write(file_out, block_line, trailer_len) != (uint16_t)trailer_len) {
-                FURI_LOG_E(TAG, "Errore scrittura trailer settore %d", sector);
-                goto cleanup;
-            }
         } else {
-            // Blocco dati standard
-            int line_len = snprintf(
-                block_line,
-                sizeof(block_line),
+            line_len = snprintf(
+                block_line, sizeof(block_line),
                 "Block %d: %02X %02X %02X %02X %02X %02X %02X %02X "
                 "%02X %02X %02X %02X %02X %02X %02X %02X\n",
                 block,
@@ -452,15 +436,16 @@ static bool convert_bin_to_nfc(const char* bin_path) {
                 b[4],  b[5],  b[6],  b[7],
                 b[8],  b[9],  b[10], b[11],
                 b[12], b[13], b[14], b[15]);
-            if(storage_file_write(file_out, block_line, line_len) != (uint16_t)line_len) {
-                FURI_LOG_E(TAG, "Errore scrittura blocco %d", block);
-                goto cleanup;
-            }
+        }
+
+        if(storage_file_write(file_out, block_line, line_len) != (uint16_t)line_len) {
+            FURI_LOG_E(TAG, "Errore scrittura blocco %d", block);
+            goto cleanup;
         }
     }
 
     success = true;
-    FURI_LOG_I(TAG, "Conversione BIN->NFC completata: %s", out_path);
+    FURI_LOG_I(TAG, "BIN->NFC OK: %s", out_path);
 
 cleanup:
     storage_file_close(file_in);
@@ -474,10 +459,18 @@ cleanup:
 
 // =========================================================
 // GUI E ENTRY POINT
+//
+// MENU:
+//   0 = Scrivi UFUID   (.bin -> tag via backdoor Gen1/Gen2)
+//   1 = Sigilla UFUID  (comando E1 dopo scrittura)
+//   2 = FUID: bin>nfc  (.bin -> .nfc per app NFC nativa)
+//
+// FUID NON compare come "scrivi tag" perche' il Flipper
+// non puo' scrivere un FUID direttamente: serve prima
+// convertire il .bin in .nfc e poi usare l'app NFC nativa.
 // =========================================================
 
-// Menu: 0=Scrivi FUID, 1=Scrivi UFUID, 2=Sigilla UFUID, 3=Converti BIN→NFC
-#define MENU_ITEMS_COUNT 4
+#define MENU_ITEMS_COUNT 3
 
 typedef enum { AppMenu, AppProcessing, AppSuccess, AppError, AppConverted } AppState;
 
@@ -498,12 +491,12 @@ static void draw_callback(Canvas* canvas, void* ctx) {
         canvas_set_font(canvas, FontSecondary);
         for(uint8_t i = 0; i < MENU_ITEMS_COUNT; i++) {
             if(i == context->menu_index) {
-                canvas_draw_box(canvas, 4, 16 + (i * 12), 120, 11);
+                canvas_draw_box(canvas, 4, 18 + (i * 14), 120, 12);
                 canvas_set_color(canvas, ColorWhite);
             } else {
                 canvas_set_color(canvas, ColorBlack);
             }
-            canvas_draw_str(canvas, 8, 25 + (i * 12), context->menu_items[i]);
+            canvas_draw_str(canvas, 8, 27 + (i * 14), context->menu_items[i]);
             canvas_set_color(canvas, ColorBlack);
         }
     } else if(context->state == AppProcessing) {
@@ -516,15 +509,16 @@ static void draw_callback(Canvas* canvas, void* ctx) {
         canvas_draw_str_aligned(canvas, 64, 38, AlignCenter, AlignCenter, "Operazione completata");
         canvas_draw_str_aligned(canvas, 64, 50, AlignCenter, AlignCenter, "Premi BACK per tornare");
     } else if(context->state == AppConverted) {
-        canvas_draw_str_aligned(canvas, 64, 16, AlignCenter, AlignCenter, "CONVERTITO!");
+        canvas_draw_str_aligned(canvas, 64, 12, AlignCenter, AlignCenter, "CONVERTITO!");
         canvas_set_font(canvas, FontSecondary);
-        canvas_draw_str_aligned(canvas, 64, 30, AlignCenter, AlignCenter, "File .nfc creato su SD");
-        canvas_draw_str_aligned(canvas, 64, 42, AlignCenter, AlignCenter, "Scrivi con app NFC");
-        canvas_draw_str_aligned(canvas, 64, 54, AlignCenter, AlignCenter, "Premi BACK per tornare");
+        canvas_draw_str_aligned(canvas, 64, 26, AlignCenter, AlignCenter, "File .nfc salvato su SD");
+        canvas_draw_str_aligned(canvas, 64, 38, AlignCenter, AlignCenter, "Ora usa app NFC nativa");
+        canvas_draw_str_aligned(canvas, 64, 50, AlignCenter, AlignCenter, "per scrivere il FUID");
+        canvas_draw_str_aligned(canvas, 64, 60, AlignCenter, AlignCenter, "Premi BACK");
     } else if(context->state == AppError) {
         canvas_draw_str_aligned(canvas, 64, 18, AlignCenter, AlignCenter, "ERRORE");
         canvas_set_font(canvas, FontSecondary);
-        canvas_draw_str_aligned(canvas, 64, 32, AlignCenter, AlignCenter, "Tag non letto o fallito");
+        canvas_draw_str_aligned(canvas, 64, 32, AlignCenter, AlignCenter, "Operazione fallita");
         canvas_draw_str_aligned(canvas, 64, 44, AlignCenter, AlignCenter, "Leggi log su qFlipper");
         canvas_draw_str_aligned(canvas, 64, 56, AlignCenter, AlignCenter, "Premi BACK");
     }
@@ -541,10 +535,9 @@ int32_t ufuid_sealer_app(void* p) {
     AppContext* context    = malloc(sizeof(AppContext));
     context->state         = AppMenu;
     context->menu_index    = 0;
-    context->menu_items[0] = "1. Scrivi tag FUID";
-    context->menu_items[1] = "2. Scrivi tag UFUID";
-    context->menu_items[2] = "3. Sigilla tag UFUID";
-    context->menu_items[3] = "4. Prepara FUID (.bin>.nfc)";
+    context->menu_items[0] = "1. Scrivi UFUID (.bin)";
+    context->menu_items[1] = "2. Sigilla UFUID";
+    context->menu_items[2] = "3. FUID: .bin -> .nfc";
     context->event_queue   = furi_message_queue_alloc(8, sizeof(InputEvent));
 
     ViewPort* view_port = view_port_alloc();
@@ -571,10 +564,8 @@ int32_t ufuid_sealer_app(void* p) {
                         bool        go_ahead  = true;
                         FuriString* file_path = furi_string_alloc();
 
-                        // Azioni 0,1,3 richiedono un file .bin
-                        if(context->menu_index == 0 ||
-                           context->menu_index == 1 ||
-                           context->menu_index == 3) {
+                        // Voce 0 (scrivi UFUID) e voce 2 (converti FUID) richiedono .bin
+                        if(context->menu_index == 0 || context->menu_index == 2) {
                             furi_string_set(file_path, EXT_PATH("nfc"));
                             DialogsApp* dialogs = furi_record_open(RECORD_DIALOGS);
                             DialogsFileBrowserOptions browser_options;
@@ -590,14 +581,15 @@ int32_t ufuid_sealer_app(void* p) {
                             furi_delay_ms(200);
                             furi_message_queue_reset(context->event_queue);
 
-                            if(context->menu_index == 3) {
-                                // Conversione pura BIN→NFC, nessun accesso radio
+                            if(context->menu_index == 2) {
+                                // FUID: conversione pura, nessun radio
                                 bool success = convert_bin_to_nfc(
                                     furi_string_get_cstr(file_path));
                                 context->state = success ? AppConverted : AppError;
                                 view_port_update(view_port);
                             } else {
-                                // Operazioni NFC (0=FUID, 1=UFUID, 2=Sigilla)
+                                // UFUID: operazioni radio
+                                // menu 0 -> action 0 (scrivi), menu 1 -> action 1 (sigilla)
                                 context->state = AppProcessing;
                                 view_port_update(view_port);
 
