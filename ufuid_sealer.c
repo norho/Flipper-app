@@ -169,7 +169,6 @@ static bool try_gen2_backdoor(void) {
     return true;
 }
 
-// FIX: La "porta aperta". Nessuna backdoor, solo sveglia il tag e attaccalo.
 static bool try_direct_write(void) {
     FURI_LOG_I(TAG, "TRY DIRECT WRITE (NO BACKDOOR)");
     return nfc_iso14443a_wake_and_select();
@@ -188,15 +187,15 @@ static bool prepare_fuid_tag(void) {
     force_hardware_reset(80); 
     if(try_gen1_proxmark_backdoor()) return true;
     force_hardware_reset(40);
-    if(try_direct_write()) return true; // Asso nella manica per i FUID "Porta Aperta"
+    if(try_direct_write()) return true; 
     
     return false;
 }
 
 static bool prepare_ufuid_tag(void) {
-    if(try_gen2_backdoor()) return true; 
+    if(try_gen1_backdoor()) return true; 
     force_hardware_reset(40);
-    if(try_gen1_backdoor()) return true;
+    if(try_gen2_backdoor()) return true;
     force_hardware_reset(80);
     if(try_gen1_proxmark_backdoor()) return true;
     return false;
@@ -321,6 +320,10 @@ static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
             tag_ready = prepare_fuid_tag();
         } else {
             tag_ready = prepare_ufuid_tag();
+            if(!tag_ready) {
+                force_hardware_reset(40);
+                continue;
+            }
         }
 
         if(tag_ready) {
@@ -367,7 +370,7 @@ static void draw_callback(Canvas* canvas, void* ctx) {
     canvas_set_font(canvas, FontPrimary);
 
     if(context->state == AppMenu) {
-        canvas_draw_str_aligned(canvas, 64, 5, AlignCenter, AlignTop, "UFUID Sealer v16.0");
+        canvas_draw_str_aligned(canvas, 64, 5, AlignCenter, AlignTop, "UFUID Sealer v17.0");
         canvas_set_font(canvas, FontSecondary);
         for(uint8_t i = 0; i < 3; i++) {
             if(i == context->menu_index) {
@@ -391,8 +394,8 @@ static void draw_callback(Canvas* canvas, void* ctx) {
     } else if(context->state == AppError) {
         canvas_draw_str_aligned(canvas, 64, 20, AlignCenter, AlignCenter, "ERRORE");
         canvas_set_font(canvas, FontSecondary);
-        canvas_draw_str_aligned(canvas, 64, 35, AlignCenter, AlignCenter, "Tag non letto o fallito");
-        canvas_draw_str_aligned(canvas, 64, 45, AlignCenter, AlignCenter, "Leggi log su qFlipper");
+        canvas_draw_str_aligned(canvas, 64, 35, AlignCenter, AlignCenter, "Tag non letto o rifiutato");
+        canvas_draw_str_aligned(canvas, 64, 45, AlignCenter, AlignCenter, "Usa App Flipper per i FUID");
         canvas_draw_str_aligned(canvas, 64, 55, AlignCenter, AlignCenter, "Premi BACK");
     }
 }
