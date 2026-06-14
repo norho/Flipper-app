@@ -46,7 +46,8 @@ static bool nfc_send_recv(uint8_t* tx, size_t tx_bits, uint8_t* rx, size_t rx_ma
     }
 
     if(!rx_success) return false;
-    if(furi_hal_nfc_poller_rx(rx, rx_max, rx_bits) != FuriHalNfcErrorNone) return false;
+    
+    furi_hal_nfc_poller_rx(rx, rx_max, rx_bits);
     return (*rx_bits > 0);
 }
 
@@ -76,7 +77,7 @@ static bool nfc_iso14443a_wake_and_select(void) {
 
     uint8_t anticoll[2] = {0x93, 0x20};
     if(!nfc_send_recv(anticoll, 16, rx, sizeof(rx), &rx_bits)) return false;
-    if(rx_bits < 32) return false; 
+    if(rx_bits < 40) return false; // FIX: Controllo di integrità dell'UID ISO14443A rafforzato a 40 bit (come suggerito)
 
     uint8_t select_cmd[9] = {0x93, 0x70, rx[0], rx[1], rx[2], rx[3], rx[4], 0, 0};
     append_crc(select_cmd, 7);
@@ -86,71 +87,14 @@ static bool nfc_iso14443a_wake_and_select(void) {
 }
 
 // =========================================================
-// SEQUENZE BACKDOOR (GEN1, GEN2 & DIRECT)
+// MOTORI BACKDOOR E SCRITTURA
 // =========================================================
-
-static bool gen1_magic_knock(void) {
-    uint8_t rx[32];
-    size_t  rx_bits = 0;
-    uint8_t c1 = 0x40;
-    
-    furi_thread_flags_clear(0xFFFFFFFF);
-    if(furi_hal_nfc_poller_tx(&c1, 7) != FuriHalNfcErrorNone) return false;
-
-    bool rx_success = false;
-    uint32_t start_time = furi_get_tick();
-    
-    while(furi_get_tick() - start_time < 200) {
-        FuriHalNfcEvent event = furi_hal_nfc_poller_wait_event(20);
-        if(event & FuriHalNfcEventRxEnd) {
-            rx_success = true;
-            break;
-        }
-        if((event & FuriHalNfcEventTimeout) && (furi_get_tick() - start_time > 150)) {
-            break;
-        }
-    }
-    
-    if(!rx_success) return false;
-    
-    furi_hal_nfc_poller_rx(rx, sizeof(rx), &rx_bits);
-    if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
-
-    uint8_t c2 = 0x43;
-    if(!nfc_send_recv(&c2, 8, rx, sizeof(rx), &rx_bits)) return false;
-    if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) return false;
-
-    return true;
-}
-
-static bool try_gen1_backdoor(void) {
-    FURI_LOG_I(TAG, "TRY GEN1 COLD (0x40)");
-    return gen1_magic_knock();
-}
-
-static bool try_gen1_wake_backdoor(void) {
-    FURI_LOG_I(TAG, "TRY GEN1 WAKE");
-    uint8_t rx[32]; size_t rx_bits = 0; uint8_t wupa = 0x52;
-    nfc_send_recv(&wupa, 7, rx, sizeof(rx), &rx_bits);
-    furi_delay_ms(5);
-    nfc_send_recv(&wupa, 7, rx, sizeof(rx), &rx_bits);
-    if(!nfc_iso14443a_wake_and_select()) return false;
-    return gen1_magic_knock();
-}
-
-static bool try_gen1_proxmark_backdoor(void) {
-    FURI_LOG_I(TAG, "TRY GEN1 PROXMARK");
-    if(!nfc_iso14443a_wake_and_select()) return false;
-    nfc_send_halt_only();
-    furi_delay_ms(30); 
-    return gen1_magic_knock();
-}
 
 static bool try_gen2_backdoor(void) {
     uint8_t rx[32];
     size_t rx_bits = 0;
 
-    FURI_LOG_I(TAG, "TRY GEN2 PROTOCOL (0x60)");
+    FURI_LOG_I(TAG, "Sblocco Gen2 (UFUID)");
     if(!nfc_iso14443a_wake_and_select()) return false;
 
     uint8_t auth_cmd[] = {0x60, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00};
@@ -169,53 +113,43 @@ static bool try_gen2_backdoor(void) {
     return true;
 }
 
-static bool try_direct_write(void) {
-    FURI_LOG_I(TAG, "TRY DIRECT WRITE (NO BACKDOOR)");
-    return nfc_iso14443a_wake_and_select();
-}
-
-// =========================================================
-// MOTORI ISOLATI
-// =========================================================
-
-static bool prepare_fuid_tag(void) {
-    if(try_gen2_backdoor()) return true;
-    force_hardware_reset(40);
-    if(try_gen1_backdoor()) return true;
-    force_hardware_reset(40);
-    if(try_gen1_wake_backdoor()) return true;
-    force_hardware_reset(80); 
-    if(try_gen1_proxmark_backdoor()) return true;
-    force_hardware_reset(40);
-    if(try_direct_write()) return true; 
+// L'ATTACCO CIECO PER I FUID MUTI
+static bool try_gen1_blind_knock(void) {
+    FURI_LOG_I(TAG, "Sblocco Gen1 BLIND (FUID)");
     
-    return false;
-}
+    uint8_t c1 = 0x40;
+    furi_thread_flags_clear(0xFFFFFFFF);
+    if(furi_hal_nfc_poller_tx(&c1, 7) != FuriHalNfcErrorNone) return false;
+    
+    // Non controlliamo MAI la risposta. I FUID AA55C396 non mandano l'ACK a 0x40.
+    furi_delay_ms(15); 
 
-static bool prepare_ufuid_tag(void) {
-    if(try_gen1_backdoor()) return true; 
-    force_hardware_reset(40);
-    if(try_gen2_backdoor()) return true;
-    force_hardware_reset(80);
-    if(try_gen1_proxmark_backdoor()) return true;
-    return false;
+    uint8_t c2 = 0x43;
+    furi_thread_flags_clear(0xFFFFFFFF);
+    if(furi_hal_nfc_poller_tx(&c2, 8) != FuriHalNfcErrorNone) return false;
+    
+    furi_delay_ms(15); 
+    
+    // A questo punto, se era un FUID, la porta è aperta in silenzio.
+    return true;
 }
-// =========================================================
-// MOTORE DI SCRITTURA E SIGILLATURA
-// =========================================================
 
 static bool nfc_write_block(uint8_t block_num, uint8_t* data) {
     uint8_t rx[32];
     size_t  rx_bits = 0;
 
+    FURI_LOG_I(TAG, "WRITE BLOCK %d", block_num);
+
     uint8_t cmd[4] = {0xA0, block_num, 0, 0};
     append_crc(cmd, 2);
     if(!nfc_send_recv(cmd, 32, rx, sizeof(rx), &rx_bits)) {
-        FURI_LOG_E(TAG, "Write B%d 0xA0 TMO/ERR", block_num);
+        FURI_LOG_E(TAG, "WRITE BLOCK %d FAILED (0xA0 Timeout)", block_num);
         return false;
     }
+    
+    FURI_LOG_I(TAG, "WRITE ACK BITS=%zu, ACK=%02X", rx_bits, rx[0]); // Sonda Diagnostica
     if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) {
-        FURI_LOG_E(TAG, "Write B%d 0xA0 NAK", block_num);
+        FURI_LOG_E(TAG, "WRITE BLOCK %d FAILED (0xA0 NAK)", block_num);
         return false;
     }
 
@@ -223,11 +157,11 @@ static bool nfc_write_block(uint8_t block_num, uint8_t* data) {
     memcpy(write_data, data, 16);
     append_crc(write_data, 16);
     if(!nfc_send_recv(write_data, 144, rx, sizeof(rx), &rx_bits)) {
-        FURI_LOG_E(TAG, "Write B%d DATA TMO/ERR", block_num);
+        FURI_LOG_E(TAG, "WRITE BLOCK %d FAILED (DATA Timeout)", block_num);
         return false;
     }
     if(rx_bits < 4 || (rx[0] & 0x0F) != 0x0A) {
-        FURI_LOG_E(TAG, "Write B%d DATA NAK", block_num);
+        FURI_LOG_E(TAG, "WRITE BLOCK %d FAILED (DATA NAK)", block_num);
         return false;
     }
     return true;
@@ -244,15 +178,15 @@ static bool core_write_mifare_bin(const char* file_path) {
         return false;
     }
     
-    size_t bytes_read = 0;
+    bool ok = false;
     if(storage_file_open(file, file_path, FSAM_READ, FSOM_OPEN_EXISTING)) {
-        bytes_read = storage_file_read(file, dump, 1024);
+        ok = (storage_file_read(file, dump, 1024) == 1024);
     }
     storage_file_close(file);
     storage_file_free(file);
     furi_record_close(RECORD_STORAGE);
 
-    if(bytes_read != 1024) {
+    if(!ok) {
         free(dump);
         return false;
     }
@@ -267,9 +201,7 @@ static bool core_write_mifare_bin(const char* file_path) {
     }
     
     if(success) {
-        if(!nfc_write_block(0, &dump[0])) {
-            success = false;
-        }
+        if(!nfc_write_block(0, &dump[0])) success = false;
     }
 
     free(dump);
@@ -316,13 +248,14 @@ static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
     while(furi_get_tick() - start_time < 5000) {
         bool tag_ready = false;
         
-        if (action_index == 0) {
-            tag_ready = prepare_fuid_tag();
-        } else {
-            tag_ready = prepare_ufuid_tag();
+        if (action_index == 0) { // FUID Mode
+            // Facciamo i sordi e forziamo le chiavi senza aspettare conferme.
+            tag_ready = try_gen1_blind_knock();
+        } else { // UFUID Mode
+            tag_ready = try_gen2_backdoor();
             if(!tag_ready) {
                 force_hardware_reset(40);
-                continue;
+                continue; // L'UFUID deve farsi riconoscere
             }
         }
 
@@ -340,12 +273,7 @@ static bool execute_nfc_action(uint8_t action_index, const char* file_path) {
     furi_hal_nfc_low_power_mode_start();
     furi_hal_nfc_release();
 
-    notification_message(notifications, &sequence_blink_stop);
-    if(result) {
-        notification_message(notifications, &sequence_success);
-    } else {
-        notification_message(notifications, &sequence_error);
-    }
+    notification_message(notifications, result ? &sequence_success : &sequence_error);
     furi_record_close(RECORD_NOTIFICATION);
 
     return result;
@@ -370,7 +298,7 @@ static void draw_callback(Canvas* canvas, void* ctx) {
     canvas_set_font(canvas, FontPrimary);
 
     if(context->state == AppMenu) {
-        canvas_draw_str_aligned(canvas, 64, 5, AlignCenter, AlignTop, "UFUID Sealer v17.0");
+        canvas_draw_str_aligned(canvas, 64, 5, AlignCenter, AlignTop, "UFUID & FUID Tool");
         canvas_set_font(canvas, FontSecondary);
         for(uint8_t i = 0; i < 3; i++) {
             if(i == context->menu_index) {
@@ -394,8 +322,8 @@ static void draw_callback(Canvas* canvas, void* ctx) {
     } else if(context->state == AppError) {
         canvas_draw_str_aligned(canvas, 64, 20, AlignCenter, AlignCenter, "ERRORE");
         canvas_set_font(canvas, FontSecondary);
-        canvas_draw_str_aligned(canvas, 64, 35, AlignCenter, AlignCenter, "Tag non letto o rifiutato");
-        canvas_draw_str_aligned(canvas, 64, 45, AlignCenter, AlignCenter, "Usa App Flipper per i FUID");
+        canvas_draw_str_aligned(canvas, 64, 35, AlignCenter, AlignCenter, "Tag non letto o fallito");
+        canvas_draw_str_aligned(canvas, 64, 45, AlignCenter, AlignCenter, "Leggi log su qFlipper");
         canvas_draw_str_aligned(canvas, 64, 55, AlignCenter, AlignCenter, "Premi BACK");
     }
 }
