@@ -1,32 +1,32 @@
-# Flipper Zero UFUID/FUID Sealer & Writer
-
-A custom Flipper Zero application (FAP) developed to write MIFARE Classic `.bin` dumps directly to UFUID and FUID magic tags, followed by an automatic and irreversible sealing process. 
-
-This tool is highly optimized for modern custom firmware architectures (such as Momentum) and utilizes low-level Poller APIs with manual CRC-A calculation for maximum stability and reliability.
-
-## 🌟 Features
-- **Direct `.bin` Flashing:** Reads a raw dump file (`bambu_tag_dump.bin`) from the Flipper's SD card and writes it block-by-block.
-- **UFUID Permanent Sealing:** Automatically sends the raw backdoor lock commands (`0x40` at 7-bits, `0x43`, `0xE1 0x00`, `0x85...`) to permanently lock the UID.
-- **FUID Support:** Writes flawlessly to FUID tags (which auto-lock upon the first Block 0 write).
-- **Modern API Compatibility:** Built using `furi_hal_nfc_poller_tx` and `furi_hal_nfc_poller_rx`, completely bypassing outdated HAL functions that cause compilation errors on newer firmware versions.
-
-## 📂 Prerequisites & File Structure
-Before launching the application, you must place your target `.bin` dump on the Flipper Zero's SD card at the exact following path:
-`SD Card/nfc/bambu_tag_dump.bin`
-
-## 🛠️ Build Instructions
-This project is built using the official `ufbt` (micro Flipper Build Tool).
-1. Clone this repository to your local machine.
-2. Open your terminal inside the project directory.
-3. Run `ufbt` to compile the `.fap` application.
-4. The compiled application will be generated in the `dist` folder.
-5. Copy the `.fap` file to `SD Card/apps/NFC` on your Flipper Zero (via qFlipper or directly to the SD).
-
-## 🚀 Usage
-1. Open the **UFUID Sealer** app from the `Applications -> NFC` menu on your Flipper Zero.
-2. Place your blank UFUID or FUID tag on the back of the Flipper.
-3. Wait a few seconds for the read/write/seal process to complete. You can monitor the detailed progress and block-by-block status via the `qFlipper` CLI logs.
-4. Once sealed, the tag will behave exactly like a standard, read-only MIFARE Classic tag.
-
-## ⚠️ Disclaimer
-This software is provided for educational purposes and legitimate hardware prototyping only. Use it strictly on devices, tags, and systems you own or have explicit authorization to interact with.
+Flipper Zero UFUID/FUID Sealer & Writer
+​A custom Flipper Zero application (FAP) designed for the precise writing and sealing of MIFARE Classic data to magic tags.
+​Release 1.4 introduces a robust, crash-proof architecture that separates the high-speed radio engine (for UFUIDs) from the secure JIT compilation engine (for FUIDs). This ensures total system stability and hardware safety.
+​🌟 Features
+​Optimized UFUID Engine: Direct, high-speed flashing and automatic sealing for Gen2 UFUID magic tags.
+​JIT FUID Converter: An integrated "Just-In-Time" tool to convert any .bin dump into a native .nfc file. This allows FUID cards to be written securely via the Flipper's official NFC application, bypassing hardware-level risks for locked-door tags.
+​Crash-Proof Architecture: Asynchronous state machine that eliminates "ViewPort lockups" and protects the NFC radio from kernel panics.
+​Modern API Compatibility: Built using current furi_hal_nfc poller APIs for maximum compatibility with modern firmware (Momentum, Unleashed, Official).
+​📂 Prerequisites & File Structure
+​Place your source .bin dumps in the following directory:
+SD Card/nfc/
+​🚀 Writing Procedures
+​1. Writing to UFUID Cards (Gen2)
+​UFUID tags feature a back-door for direct block access.
+​Select "Scrivi tag UFUID" from the menu.
+​Select your .bin file.
+​The app will automatically unlock the tag, write the data block-by-block, and complete the process.
+​(Optional) Use "Sigilla tag UFUID" to perform the irreversible locking sequence (0xE1, 0x85).
+​2. Writing to FUID Cards
+​FUID cards are cryptographically locked and do not support magic commands.
+​Select "Prepara FUID (.bin > .nfc)" from the menu.
+​Select your .bin file. The app will generate a .nfc file in the same folder.
+​Exit our app and open the native Flipper NFC application.
+​Select the newly created .nfc file and use the native "Write" function to deploy the data securely.
+​🛠️ Build Instructions
+​This project is built using the official ufbt (micro Flipper Build Tool).
+​Clone this repository to your local machine.
+​Open your terminal inside the project directory.
+​Run ufbt to compile the .fap application.
+​Copy the resulting .fap file from the dist folder to SD Card/apps/NFC/ on your Flipper Zero.
+​⚠️ Disclaimer
+​This software is provided for educational purposes and legitimate hardware prototyping only. Use it strictly on devices, tags, and systems you own or have explicit authorization to interact with. 
